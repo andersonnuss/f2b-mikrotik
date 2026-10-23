@@ -12,6 +12,8 @@ Funcionamento
   * So mexe nas entradas da address-list cujo comentario comeca com `comment_prefix`;
     entradas manuais na mesma lista sao preservadas.
   * Se o fail2ban nao responder, nada e removido do roteador (fail-safe).
+  * Blacklist: arquivo texto com um IP ou rede por linha, bloqueados independentemente do
+    fail2ban. O arquivo e relido sozinho quando alterado; apagar a linha libera no roteador.
 
 Fala com o roteador pela API do RouterOS (porta 8728, ou 8729 com SSL), implementada
 aqui mesmo: nenhuma dependencia externa, apenas Python 3.6+.
@@ -41,7 +43,7 @@ import subprocess
 import sys
 import time
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 log = logging.getLogger("f2b-mikrotik")
 
@@ -318,6 +320,15 @@ class LogWatcher:
 # Agente
 # --------------------------------------------------------------------------- #
 LIST_PATHS = {4: "/ip/firewall/address-list", 6: "/ipv6/firewall/address-list"}
+BLACKLIST_TAG = "blacklist"
+
+
+class BlacklistError(Exception):
+    pass
+
+
+def is_network(entry):
+    return isinstance(entry, (ipaddress.IPv4Network, ipaddress.IPv6Network))
 
 
 def normalize_ip(text):
@@ -346,6 +357,7 @@ class Agent:
         self.f2b = Fail2ban(f2b.get("client"), parse_list(f2b.get("jails")))
         self.f2b_log = f2b.get("logfile").strip()
         self.whitelist = [ipaddress.ip_network(n, strict=False) for n in parse_list(f2b.get("whitelist"))]
+        self.blacklist_file = cfg["blacklist"].get("file").strip()
         self.sync_interval = ag.getfloat("sync_interval")
         self.debounce = ag.getfloat("debounce")
         self.retry_delay = ag.getfloat("retry_delay")
@@ -358,11 +370,73 @@ class Agent:
     def _api(self):
         return RouterOSApi(**self.router)
 
-    def _whitelisted(self, ip):
-        return any(ip.version == net.version and ip in net for net in self.whitelist)
+    def _whitelisted(self, entry):
+        for net in self.whitelist:
+            if entry.version == net.version and (entry.overlaps(net) if is_network(entry) else entry in net):
+                return True
+        return False
+
+    def _blacklist(self):
+        """Le a blacklist: {chave: (ip_ou_rede, {"blacklist"})}. Arquivo ausente = vazia."""
+        result = {}
+        if not self.blacklist_file:
+            return result
+        try:
+            with open(self.blacklist_file, encoding="utf-8") as fh:
+                lines = fh.readlines()
+        except FileNotFoundError:
+            return result
+        except OSError as e:
+            raise BlacklistError("nao foi possivel ler a blacklist %s: %s" % (self.blacklist_file, e))
+        for n, line in enumerate(lines, 1):
+            text = line.split("#", 1)[0].strip()
+            if not text:
+                continue
+            entry = normalize_ip(text.split()[0])
+            if entry is None:
+                self._log_ignored(text, "linha %d da blacklist invalida" % n)
+            elif self._whitelisted(entry):
+                self._log_ignored(str(entry), "esta na blacklist, mas tambem na whitelist")
+            elif entry.version not in self.families:
+                self._log_ignored(str(entry), "IPv6 desabilitado na configuracao")
+            else:
+                result[str(entry)] = (entry, {BLACKLIST_TAG})
+        return result
+
+    def _blacklist_signature(self):
+        try:
+            st = os.stat(self.blacklist_file)
+            return (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return None
+
+    @staticmethod
+    def _merge(banned, blacklist):
+        desired = {k: (entry, set(tags)) for k, (entry, tags) in blacklist.items()}
+        networks = [entry for entry, _ in blacklist.values() if is_network(entry)]
+        for key, (ip, jails) in banned.items():
+            if key in desired:
+                desired[key][1].update(jails)
+            elif not any(ip.version == net.version and ip in net for net in networks):
+                desired[key] = (ip, jails)  # IP dentro de uma rede da blacklist ja esta bloqueado
+        return desired
 
     def _desired(self):
-        """IPs que devem estar bloqueados no roteador: {ip_str: (ip, jails)}."""
+        """O que deve estar bloqueado no roteador: ({chave: (ip_ou_rede, origens)}, fail2ban_ok).
+
+        Se o fail2ban estiver fora do ar, aplica so a blacklist e sinaliza para nada ser removido."""
+        blacklist = self._blacklist()
+        try:
+            banned = self._from_fail2ban()
+        except Fail2banError as e:
+            if not blacklist:
+                raise
+            self._report_error("fail2ban indisponivel; aplicando apenas a blacklist, nada sera removido: %s" % e)
+            return blacklist, False
+        return self._merge(banned, blacklist), True
+
+    def _from_fail2ban(self):
+        """IPs banidos no fail2ban: {ip_str: (ip, jails)}."""
         desired = {}
         for raw, jails in self.f2b.banned().items():
             ip = normalize_ip(raw)
@@ -403,12 +477,13 @@ class Agent:
     # -- operacoes ----------------------------------------------------------------
     def sync(self, reason="periodica"):
         """Reconciliacao completa. Retorna True se nao houve erros."""
-        desired = self._desired()  # se o fail2ban falhar, levanta excecao antes de tocar no roteador
+        # se fail2ban e blacklist falharem, levanta excecao antes de tocar no roteador
+        desired, f2b_ok = self._desired()
         added = removed = errors = 0
         with self._api() as api:
             managed, others = self._router_entries(api)
             to_add = sorted(k for k in desired if k not in managed and k not in others)
-            to_remove = sorted(k for k in managed if k not in desired)
+            to_remove = sorted(k for k in managed if k not in desired) if f2b_ok else []
             stamp = time.strftime("%Y-%m-%d %H:%M:%S")
 
             for key in to_add:
@@ -443,9 +518,9 @@ class Agent:
                     log.error("erro ao liberar %s no MikroTik: %s", key, e)
 
         level = logging.INFO if (to_add or to_remove or errors) else logging.DEBUG
-        log.log(level, "sincronizacao %s: %d banidos no fail2ban, %d no roteador | +%d -%d, %d erro(s)",
+        log.log(level, "sincronizacao %s: %d a bloquear (fail2ban + blacklist), %d no roteador | +%d -%d, %d erro(s)",
                 reason, len(desired), len(managed) + added - removed, added, removed, errors)
-        return errors == 0
+        return errors == 0 and f2b_ok
 
     def flush(self):
         with self._api() as api:
@@ -461,13 +536,28 @@ class Agent:
 
     def test(self):
         ok = True
+        desired = None
+        print("blacklist ...", end=" ", flush=True)
+        try:
+            blacklist = self._blacklist()
+            if not self.blacklist_file:
+                print("desativada")
+            elif not os.path.exists(self.blacklist_file):
+                print("OK - %s nao existe (vazia)" % self.blacklist_file)
+            else:
+                print("OK - %d entrada(s) em %s" % (len(blacklist), self.blacklist_file))
+        except BlacklistError as e:
+            print("FALHOU: %s" % e)
+            blacklist, ok = {}, False
         print("fail2ban ...", end=" ", flush=True)
         try:
-            desired = self._desired()
-            print("OK - %d IP(s) banido(s) a replicar" % len(desired))
+            banned = self._from_fail2ban()
+            print("OK - %d IP(s) banido(s) a replicar" % len(banned))
+            if ok:
+                desired = self._merge(banned, blacklist)
         except Fail2banError as e:
             print("FALHOU: %s" % e)
-            desired, ok = None, False
+            ok = False
         print("MikroTik %s:%s ..." % (self.router["host"], self.router["port"]), end=" ", flush=True)
         try:
             with self._api() as api:
@@ -488,12 +578,14 @@ class Agent:
     def safe_sync(self, reason):
         try:
             ok = self.sync(reason)
-            if self._last_error[0] is not None:
+            if ok and self._last_error[0] is not None:
                 log.info("comunicacao restabelecida")
                 self._last_error = (None, 0.0)
             return ok
         except Fail2banError as e:
             self._report_error("fail2ban indisponivel, nada foi alterado no roteador: %s" % e)
+        except BlacklistError as e:
+            self._report_error("%s; nada foi alterado no roteador" % e)
         except (RouterOSError, OSError) as e:
             self._report_error("falha ao comunicar com o MikroTik %s:%s: %s"
                                % (self.router["host"], self.router["port"], e))
@@ -518,17 +610,26 @@ class Agent:
         signal.signal(signal.SIGINT, on_signal)
 
         watcher = LogWatcher(self.f2b_log) if self.f2b_log else None
+        bl_sig = self._blacklist_signature() if self.blacklist_file else None
         next_sync = 0.0
         pending_since = last_event = None
 
         while not self._stop:
             now = time.monotonic()
+            changed = False
             if watcher is not None:
                 for action, jail, ip in watcher.poll():
                     log.info("fail2ban: [%s] %s %s", jail, action, ip)
-                    last_event = now
-                    if pending_since is None:
-                        pending_since = now
+                    changed = True
+            if self.blacklist_file:
+                sig = self._blacklist_signature()
+                if sig != bl_sig:
+                    log.info("blacklist %s alterada", self.blacklist_file)
+                    bl_sig, changed = sig, True
+            if changed:
+                last_event = now
+                if pending_since is None:
+                    pending_since = now
 
             due_event = pending_since is not None and (
                 now - last_event >= self.debounce or now - pending_since >= 10)
@@ -550,6 +651,7 @@ DEFAULTS = {
                  "comment_prefix": "f2b-agent", "entry_timeout": "", "ipv6": "no"},
     "fail2ban": {"client": "/usr/bin/fail2ban-client", "logfile": "/var/log/fail2ban.log", "jails": "",
                  "whitelist": "127.0.0.0/8, ::1"},
+    "blacklist": {"file": "/etc/f2b-mikrotik/blacklist.txt"},
     "agent": {"sync_interval": "60", "debounce": "2", "retry_delay": "15",
               "logfile": "/var/log/f2b-mikrotik.log", "log_level": "INFO",
               "log_max_bytes": "10485760", "log_backups": "5", "lockfile": "/run/f2b-mikrotik.lock"},

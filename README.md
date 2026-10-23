@@ -109,6 +109,33 @@ No roteador:
 /ip firewall raw print stats
 ```
 
+## Blacklist: bloqueios manuais
+
+Para bloquear no MikroTik IPs ou redes que o fail2ban não pegou, edite o arquivo:
+
+```bash
+sudo nano /etc/f2b-mikrotik/blacklist.txt
+```
+
+Use um IP ou uma rede por linha. O texto depois de `#` é comentário:
+
+```
+203.0.113.45              # scanner insistente
+198.51.100.0/24           # rede inteira
+```
+
+- Ao salvar, o agente percebe a mudança em cerca de 2 segundos e atualiza o roteador. Não precisa reiniciar o serviço.
+- Apagar ou comentar a linha libera o IP no roteador.
+- No MikroTik, essas entradas aparecem com o comentário `f2b-agent [blacklist] ...`.
+- Se uma entrada cair na `whitelist`, ela é ignorada e o motivo fica registrado no log.
+- Um IP banido pelo fail2ban que já está dentro de uma rede da blacklist não é duplicado no roteador.
+- Se o fail2ban estiver fora do ar, a blacklist continua sendo aplicada, mas nada é removido do roteador.
+
+```
+2026-10-23 21:02:10 [INFO] blacklist /etc/f2b-mikrotik/blacklist.txt alterada
+2026-10-23 21:02:12 [INFO] BLOQUEADO no MikroTik: 198.51.100.0/24 (jail: blacklist)
+```
+
 ## Alternativa: cron
 
 Em vez do serviço, rode a cada minuto (`crontab -e` do root):
@@ -125,6 +152,7 @@ Uma trava (`/run/f2b-mikrotik.lock`) impede duas execuções simultâneas.
 |---|---|
 | `jails` | replicar só algumas jails (ex.: `sshd, postfix`) |
 | `whitelist` | redes que nunca vão para o roteador |
+| `[blacklist] file` | arquivo de bloqueios manuais (vazio desativa) |
 | `entry_timeout` | ex.: `7d`. As entradas expiram sozinhas no roteador se o agente for desinstalado ou parar; enquanto o IP seguir banido, o agente o recoloca |
 | `ipv6` | replica também para `/ipv6 firewall address-list` |
 | `use_ssl` / `port` | usar `api-ssl` (8729) |

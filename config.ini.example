@@ -28,6 +28,11 @@ jails =
 ; IPs/redes que NUNCA serao bloqueados no roteador (rede interna, IP de gerencia, VPN...)
 whitelist = 127.0.0.0/8, ::1, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10
 
+[blacklist]
+; IPs/redes bloqueados sempre, independente do fail2ban: um por linha, '#' para comentarios.
+; Relido automaticamente ao ser salvo. Vazio = recurso desativado.
+file = /etc/f2b-mikrotik/blacklist.txt
+
 [agent]
 ; reconciliacao completa fail2ban x roteador (segundos)
 sync_interval = 60
