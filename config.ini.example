@@ -1,0 +1,43 @@
+; Configuracao do f2b-mikrotik  ->  /etc/f2b-mikrotik/config.ini  (chmod 600: contem senha)
+
+[mikrotik]
+host = 192.168.88.1
+; 8728 = api   |   8729 = api-ssl (use_ssl = yes)
+port = 8728
+use_ssl = no
+username = f2b-agent
+password = TROQUE-ESTA-SENHA
+timeout = 10
+; address-list que recebe os IPs (a regra de drop no roteador usa este nome)
+address_list = fail2ban
+; o agente so altera/remove entradas cujo comentario comeca com este prefixo
+comment_prefix = f2b-agent
+; validade da entrada no roteador (formato RouterOS: 1d, 12h, 30m). Vazio = permanente.
+; Rede de seguranca: se o agente parar, os bloqueios expiram sozinhos. Enquanto o IP
+; continuar banido no fail2ban, o agente o recoloca na proxima sincronizacao.
+entry_timeout =
+; replica tambem IPs IPv6 (/ipv6 firewall address-list). Exige o pacote ipv6 ativo no roteador.
+ipv6 = no
+
+[fail2ban]
+client = /usr/bin/fail2ban-client
+; log acompanhado para reagir em segundos. Vazio = so sincronizacao periodica.
+logfile = /var/log/fail2ban.log
+; jails a replicar, separadas por virgula. Vazio = todas.
+jails =
+; IPs/redes que NUNCA serao bloqueados no roteador (rede interna, IP de gerencia, VPN...)
+whitelist = 127.0.0.0/8, ::1, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10
+
+[agent]
+; reconciliacao completa fail2ban x roteador (segundos)
+sync_interval = 60
+; espera apos um evento do log antes de sincronizar (agrupa rajadas de bans)
+debounce = 2
+; nova tentativa apos falha (segundos)
+retry_delay = 15
+logfile = /var/log/f2b-mikrotik.log
+; DEBUG mostra tambem as sincronizacoes sem alteracao
+log_level = INFO
+log_max_bytes = 10485760
+log_backups = 5
+lockfile = /run/f2b-mikrotik.lock
