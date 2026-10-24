@@ -87,15 +87,57 @@ class Panel:
         self.pool = ThreadPoolExecutor(max_workers=8)
         self.events = self.agent.open_events()  # o agente grava; o painel so consulta
         self.geo = self.geo_updater = None
-        if cfg["web"].getboolean("geoip"):
-            self.geo = f2b_geo.GeoDB(cfg["web"].get("geo_file").strip() or f2b_geo.DEFAULT_FILE)
+        web = cfg["web"]
+        geo_file = web.get("geo_file").strip() or f2b_geo.DEFAULT_FILE
+        if web.getboolean("geoip"):
+            self.geo = f2b_geo.GeoDB(geo_file)
             self.geo_updater = f2b_geo.GeoUpdater(self.geo)
             self.geo_updater.start()
+        self.ipinfo = None
+        provider = web.get("geo_provider").strip().lower() or "rir"
+        if provider == "ipinfo":
+            token = web.get("ipinfo_token").strip()
+            if not token:
+                log.error("geo_provider = ipinfo, mas ipinfo_token esta vazio; usando so as tabelas dos RIRs")
+            else:
+                try:
+                    self.ipinfo = f2b_geo.IpinfoLite(
+                        token, os.path.join(os.path.dirname(geo_file) or ".", "geo_cache.db"),
+                        ttl_days=web.getint("geo_cache_days"), url=web.get("ipinfo_url").strip() or None)
+                    log.info("geo: pais via ipinfo Lite (cache %d dias), com as tabelas dos RIRs como reserva",
+                             web.getint("geo_cache_days"))
+                except (core.sqlite3.Error, OSError) as e:
+                    log.error("geo: nao foi possivel abrir o cache do ipinfo: %s; usando so os RIRs", e)
+        elif provider != "rir":
+            log.warning("geo_provider desconhecido: %r (use rir ou ipinfo); usando os RIRs", provider)
 
     # -- observabilidade ----------------------------------------------------------
+    def country_info(self, key):
+        """{'cc', 'source', 'asn', 'as_name'} de um IP/rede. cc None = desconhecido.
+
+        Com o ipinfo ligado: usa o cache dele; se o IP ainda nao foi consultado, agenda a consulta
+        (em segundo plano) e responde por enquanto com o pais dos RIRs."""
+        entry = core.normalize_ip(key) if isinstance(key, str) else key
+        info = {"cc": None, "source": None, "asn": "", "as_name": ""}
+        if entry is None:
+            return info
+        if self.geo is not None and self.geo.ready:
+            cc = self.geo.lookup(entry)
+            if cc:
+                info.update(cc=cc, source="rir")
+        if self.ipinfo is not None and not core.is_network(entry) and f2b_geo.is_public(entry):
+            hit = self.ipinfo.get(str(entry))
+            if hit is None:
+                self.ipinfo.enqueue(str(entry))
+            else:
+                info.update(asn=hit["asn"], as_name=hit["as_name"])
+                if hit["cc"]:
+                    info.update(cc=hit["cc"], source="ipinfo")
+        return info
+
     def country(self, key):
         """Codigo ISO do pais (ou None = desconhecido)."""
-        return self.geo.lookup(key) if self.geo is not None and self.geo.ready else None
+        return self.country_info(key)["cc"]
 
     def _events(self, sql, args=()):
         if self.events is None:
@@ -116,7 +158,9 @@ class Panel:
         return {"events": self.events is not None, "events_since": first[0][0] if first else None,
                 "geo": self.geo is not None, "geo_ready": bool(self.geo and self.geo.ready),
                 "geo_updated": self.geo.updated_at() if self.geo else None,
-                "geo_error": self.geo_updater.last_error if self.geo_updater else None}
+                "geo_error": self.geo_updater.last_error if self.geo_updater else None,
+                "geo_provider": "ipinfo" if self.ipinfo is not None else "rir",
+                "ipinfo": self.ipinfo.status() if self.ipinfo is not None else None}
 
     def stats(self, hours):
         now = int(time.time())
@@ -351,7 +395,7 @@ class Panel:
         result = {"query": str(target), "is_network": core.is_network(target),
                   "whitelist": [], "fail2ban": {"ok": f2b["ok"], "error": f2b["error"], "matches": []},
                   "blacklist": {"ok": bl["ok"], "error": bl["error"], "matches": []},
-                  "desired": [], "routers": [], "country": self.country(target),
+                  "desired": [], "routers": [], "country_info": self.country_info(target),
                   "history": self.history(target), "meta": self.meta()}
         for net in a.whitelist:
             rel = relation(target, net)

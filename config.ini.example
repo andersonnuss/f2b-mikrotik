@@ -73,3 +73,11 @@ tls_key =
 ; nenhum IP e enviado a terceiros. no = sem pais (aparece "desconhecido").
 geoip = yes
 geo_file = /var/lib/f2b-mikrotik/geo.tsv.gz
+; fonte do pais: rir = so as tabelas acima (offline) | ipinfo = API gratuita ipinfo Lite
+; (geolocalizacao mais precisa: um IP da AWS em Sao Paulo aparece como Brasil, nao EUA).
+; Com ipinfo, cada IP publico e enviado uma vez ao ipinfo.io e fica em cache; se a API falhar,
+; vale o pais das tabelas dos RIRs. Token gratuito em https://ipinfo.io/signup
+geo_provider = rir
+ipinfo_token =
+; por quantos dias a resposta do ipinfo fica em cache
+geo_cache_days = 30

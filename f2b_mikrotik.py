@@ -51,7 +51,7 @@ import sys
 import threading
 import time
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 log = logging.getLogger("f2b-mikrotik")
 
@@ -947,7 +947,8 @@ DEFAULTS = {
               "routers_file": "/etc/f2b-mikrotik/routers.json",
               "events_db": "/var/lib/f2b-mikrotik/events.db", "events_retention_days": "365"},
     "web": {"bind": "0.0.0.0", "port": "8088", "username": "admin", "password": "",
-            "tls_cert": "", "tls_key": "", "geoip": "yes", "geo_file": "/var/lib/f2b-mikrotik/geo.tsv.gz"},
+            "tls_cert": "", "tls_key": "", "geoip": "yes", "geo_file": "/var/lib/f2b-mikrotik/geo.tsv.gz",
+            "geo_provider": "rir", "ipinfo_token": "", "geo_cache_days": "30", "ipinfo_url": ""},
 }
 
 

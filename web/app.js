@@ -352,7 +352,11 @@ function renderCheck(c) {
   }
 
   const facts = [];
-  facts.push(`País: ${c.is_network ? "da rede: " : ""}${countryLabel(c.country)}`);
+  const ci = c.country_info;
+  const geoSource = { ipinfo: "ipinfo", rir: "registro RIR" }[ci.source];
+  facts.push(`País: ${c.is_network ? "da rede: " : ""}${countryLabel(ci.cc)}`
+    + (geoSource ? ` <span class="muted small">(${geoSource})</span>` : "")
+    + (ci.asn || ci.as_name ? ` · provedor: ${esc([ci.asn, ci.as_name].filter(Boolean).join(" "))}` : ""));
   const h = c.history;
   if (!c.meta.events) facts.push('<span class="muted">Histórico desativado no config.ini ([agent] events_db).</span>');
   else if (h.blocks || h.unblocks) {
@@ -599,9 +603,12 @@ function renderStats() {
   const period = s.hours === 24 ? "24 h" : `${s.hours / 24} dias`;
   $("#stats-meta").innerHTML = [
     m.events ? (m.events_since ? `histórico desde ${fmtTs(m.events_since)}` : "histórico vazio") : "histórico desativado",
-    !m.geo ? "países desativados" : m.geo_ready ? `países: tabela dos RIRs de ${esc(m.geo_updated)}`
-      : (m.geo_error ? `países indisponíveis (${esc(m.geo_error)})` : "países: baixando tabela dos RIRs…"),
-  ].join(" · ");
+    m.ipinfo ? `países: ipinfo (${m.ipinfo.cached} IP(s) em cache${m.ipinfo.queued ? `, ${m.ipinfo.queued} na fila` : ""})`
+      + (m.ipinfo.error ? ` <span class="st st-warn">${esc(m.ipinfo.error)}</span>` : "") : "",
+    !m.geo ? (m.ipinfo ? "" : "países desativados")
+      : m.geo_ready ? `${m.ipinfo ? "reserva: " : "países: "}tabela dos RIRs de ${esc(m.geo_updated)}`
+        : (m.geo_error ? `tabela dos RIRs indisponível (${esc(m.geo_error)})` : "baixando tabela dos RIRs…"),
+  ].filter(Boolean).join(" · ");
   $("#stats-kpis").innerHTML = [
     [t.blocks_1h, "bloqueios na última hora"],
     [t.unblocks_1h, "desbloqueios na última hora"],

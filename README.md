@@ -178,6 +178,26 @@ No painel:
 sudo python3 /opt/f2b-mikrotik/f2b_geo.py --update 45.155.205.233
 ```
 
+**Opcional: país pela API gratuita ipinfo Lite.** As tabelas dos RIRs dão o país do **registro** do bloco de IPs. O ipinfo dá o país da **localização** estimada, que é mais preciso para nuvens e grandes provedores: um IP da AWS em São Paulo aparece como Brasil, e não como EUA. Para ativar:
+
+1. Crie um token gratuito em https://ipinfo.io/signup.
+2. No `config.ini`, coloque:
+
+```ini
+[web]
+geo_provider = ipinfo
+ipinfo_token = SEU_TOKEN
+```
+
+3. Reinicie o painel: `systemctl restart f2b-mikrotik-web`.
+
+Como funciona:
+- **Cache:** cada IP **público** é consultado uma única vez, e a resposta fica guardada por 30 dias (`geo_cache_days`) em `/var/lib/f2b-mikrotik/geo_cache.db`. IPs privados e reservados nunca são enviados, e o token não aparece no log.
+- **Sem esperar a API:** as consultas rodam em segundo plano, em no máximo 5 por segundo. Enquanto um IP ainda não foi consultado, o painel mostra o país dos RIRs; na recarga seguinte, já mostra o do ipinfo.
+- **Provedor do IP:** a consulta de IP mostra também o ASN e o nome do provedor, por exemplo `AS16509 Amazon.com, Inc.`.
+- **Falhas:** se o ipinfo responder "limite atingido", as consultas param por 10 minutos. Se recusar o token, o ipinfo é desligado até o painel ser reiniciado. Se estiver fora do ar, as consultas são retomadas 1 minuto depois. Em todos esses casos, vale o país dos RIRs, e o motivo aparece na aba Estatísticas.
+- **Privacidade:** com o ipinfo ativo, os IPs bloqueados são enviados a um serviço externo. Na maioria são atacantes, mas um cliente seu que errou a senha também entra na lista. Se isso for um problema, mantenha `geo_provider = rir`.
+
 O histórico só é registrado no modo daemon (serviço `f2b-mikrotik`). No modo cron (`--once`), não há registro de eventos.
 
 ## Vários MikroTiks
@@ -242,6 +262,7 @@ Uma trava (`/run/f2b-mikrotik.lock`) impede duas execuções simultâneas.
 | `[agent] routers_file` | arquivo dos roteadores cadastrados pelo painel |
 | `[agent] events_db` / `events_retention_days` | histórico de eventos e por quantos dias guardar |
 | `[web] geoip` / `geo_file` | país de origem (tabelas dos RIRs) |
+| `[web] geo_provider` / `ipinfo_token` / `geo_cache_days` | país via API ipinfo Lite, com cache e com as tabelas dos RIRs como reserva |
 | `entry_timeout` | ex.: `7d`. As entradas expiram sozinhas no roteador se o agente for desinstalado ou parar; enquanto o IP seguir banido, o agente o recoloca |
 | `ipv6` | replica também para `/ipv6 firewall address-list` |
 | `use_ssl` / `port` | usar `api-ssl` (8729) |
