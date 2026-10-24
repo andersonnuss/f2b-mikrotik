@@ -1,20 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-f2b-mikrotik web - painel para consultar o que esta bloqueado (fail2ban, blacklist e cada
-MikroTik) e cadastrar os roteadores adicionais que recebem os mesmos bloqueios.
+f2b-mikrotik web - painel do f2b-mikrotik.
 
-Usa o proprio f2b_mikrotik.py para falar com o fail2ban e com os roteadores; nao tem
-dependencias externas (Python 3.7+). Bloquear e liberar nos roteadores e trabalho do agente:
-o painel desbane no fail2ban e edita a blacklist e o routers.json, e o agente replica em ~2 s.
-(A unica escrita direta num roteador e a limpeza opcional ao exclui-lo do cadastro.)
+Consulta o que esta bloqueado (fail2ban, blacklist e cada MikroTik), mostra estatisticas e
+permite operar: desbanir, manter blacklist e whitelist, cadastrar roteadores, ajustar as
+configuracoes de operacao e gerenciar usuarios. Tudo o que muda fica na trilha de auditoria.
+
+A configuracao editavel fica no banco SQLite (f2b_store.py); o agente percebe as mudancas em
+~2 s e replica nos roteadores. Login por sessao (cookie HttpOnly/SameSite=Strict), com papeis:
+    leitura   - so consulta
+    operador  - + desbanir e blacklist
+    admin     - + whitelist, roteadores, configuracoes, usuarios e auditoria
+
+Sem dependencias externas (Python 3.7+).
 
     python3 f2b_web.py -c /etc/f2b-mikrotik/config.ini [--port 8088]
 """
 
 import argparse
-import base64
-import hmac
+import collections
+import csv
+import io
 import ipaddress
 import json
 import logging
@@ -34,22 +41,29 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import f2b_geo  # noqa: E402
 import f2b_mikrotik as core  # noqa: E402
+import f2b_store  # noqa: E402
 
 STATIC_DIR = os.path.join(HERE, "web")
-STATIC_FILES = {"/": ("index.html", "text/html; charset=utf-8"),
-                "/app.js": ("app.js", "application/javascript; charset=utf-8"),
+PUBLIC_FILES = {"/login": ("login.html", "text/html; charset=utf-8"),
+                "/login.js": ("login.js", "application/javascript; charset=utf-8"),
                 "/app.css": ("app.css", "text/css; charset=utf-8")}
+PRIVATE_FILES = {"/": ("index.html", "text/html; charset=utf-8"),
+                 "/app.js": ("app.js", "application/javascript; charset=utf-8")}
 MAX_BODY = 64 * 1024
 QUERY_TIMEOUT = 5.0  # o painel nao espera um roteador fora do ar pelo timeout inteiro do agente
-HOST_RE = re.compile(r"^[A-Za-z0-9.:\-\[\]]{1,253}$")
+COOKIE = "f2b_session"
+SESSION_IDLE = 8 * 3600
+ROLE_RANK = {"leitura": 0, "operador": 1, "admin": 2}
+EXPIRY_CHOICES = {0, 3600, 6 * 3600, 86400, 7 * 86400, 30 * 86400, 90 * 86400}
 
 log = logging.getLogger("f2b-web")
 
 
 class ApiError(Exception):
-    def __init__(self, status, message):
+    def __init__(self, status, message, extra=None):
         super().__init__(message)
         self.status = status
+        self.extra = extra or {}
 
 
 def relation(target, entry):
@@ -72,46 +86,144 @@ def relation(target, entry):
     return None
 
 
+def sort_key(key):
+    entry = core.normalize_ip(key)
+    if entry is None:
+        return (9, 0, key)
+    addr = entry.network_address if core.is_network(entry) else entry
+    return (entry.version, int(addr), key)
+
+
+def service_state(name):
+    try:
+        p = subprocess.run(["systemctl", "is-active", name], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                           universal_newlines=True, timeout=5)
+        return p.stdout.strip() or "desconhecido"
+    except (OSError, subprocess.TimeoutExpired):
+        return "desconhecido"
+
+
 def public_router(r):
-    out = {k: r[k] for k in core.ROUTER_FIELDS if k != "password"}
-    out["primary"] = bool(r.get("primary"))
+    out = {k: r[k] for k in ("id", "name", "host", "port", "username", "use_ssl", "timeout", "enabled")}
     out["has_password"] = bool(r.get("password"))
+    for k in ("created_at", "created_by", "updated_at", "updated_by"):
+        out[k] = r.get(k)
     return out
 
 
+# --------------------------------------------------------------------------- #
+# Sessoes e limite de tentativas de login
+# --------------------------------------------------------------------------- #
+class Sessions:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.data = {}
+
+    def create(self, username):
+        token = secrets.token_urlsafe(32)
+        with self.lock:
+            self.data[token] = {"username": username, "seen": time.time()}
+        return token
+
+    def get(self, token):
+        with self.lock:
+            s = self.data.get(token or "")
+            if s is None:
+                return None
+            if time.time() - s["seen"] > SESSION_IDLE:
+                del self.data[token]
+                return None
+            s["seen"] = time.time()
+            return s["username"]
+
+    def drop(self, token):
+        with self.lock:
+            self.data.pop(token or "", None)
+
+    def drop_user(self, username, keep=None):
+        with self.lock:
+            for t in [t for t, s in self.data.items() if s["username"].lower() == username.lower() and t != keep]:
+                del self.data[t]
+
+
+class LoginLimiter:
+    """5 falhas em 15 min a partir do mesmo IP bloqueiam novas tentativas por 15 min."""
+    WINDOW, MAX_FAILS = 900, 5
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.fails = collections.defaultdict(collections.deque)
+
+    def blocked_for(self, ip):
+        with self.lock:
+            q = self.fails[ip]
+            while q and time.time() - q[0] > self.WINDOW:
+                q.popleft()
+            return int(self.WINDOW - (time.time() - q[0])) if len(q) >= self.MAX_FAILS else 0
+
+    def fail(self, ip):
+        # um login certo nao zera o contador: senao quem tem uma conta valida intercalaria logins
+        # corretos para testar senhas de outros usuarios sem nunca ser bloqueado
+        with self.lock:
+            self.fails[ip].append(time.time())
+
+
+# --------------------------------------------------------------------------- #
+# Painel
+# --------------------------------------------------------------------------- #
 class Panel:
     def __init__(self, cfg):
         self.agent = core.Agent(cfg)
+        self.store = self.agent.store
         self.agent_log = cfg["agent"].get("logfile").strip()
         self.write_lock = threading.Lock()
         self.pool = ThreadPoolExecutor(max_workers=8)
         self.events = self.agent.open_events()  # o agente grava; o painel so consulta
-        self.geo = self.geo_updater = None
         web = cfg["web"]
-        geo_file = web.get("geo_file").strip() or f2b_geo.DEFAULT_FILE
-        if web.getboolean("geoip"):
-            self.geo = f2b_geo.GeoDB(geo_file)
+        self.geo_file = web.get("geo_file").strip() or f2b_geo.DEFAULT_FILE
+        self.ipinfo_url = web.get("ipinfo_url").strip() or None
+        self.geo = self.geo_updater = self.ipinfo = None
+        self._geo_sig = None
+        self.apply_settings()
+
+    # -- configuracao vinda do banco ------------------------------------------------
+    def refresh(self, force=False):
+        """Rele o banco (mudancas do agente/outro processo, ou forcado apos uma gravacao deste)."""
+        if self.agent.reload(force=force):
+            self.apply_settings()
+
+    def apply_settings(self):
+        s = self.agent.settings
+        sig = (s["geoip"], s["geo_provider"], s["ipinfo_token"], s["geo_cache_days"])
+        if sig == self._geo_sig:
+            return
+        self._geo_sig = sig
+        if s["geoip"] and self.geo is None:
+            self.geo = f2b_geo.GeoDB(self.geo_file)
             self.geo_updater = f2b_geo.GeoUpdater(self.geo)
             self.geo_updater.start()
-        self.ipinfo = None
-        provider = web.get("geo_provider").strip().lower() or "rir"
-        if provider == "ipinfo":
-            token = web.get("ipinfo_token").strip()
-            if not token:
-                log.error("geo_provider = ipinfo, mas ipinfo_token esta vazio; usando so as tabelas dos RIRs")
-            else:
-                try:
-                    self.ipinfo = f2b_geo.IpinfoLite(
-                        token, os.path.join(os.path.dirname(geo_file) or ".", "geo_cache.db"),
-                        ttl_days=web.getint("geo_cache_days"), url=web.get("ipinfo_url").strip() or None)
-                    log.info("geo: pais via ipinfo Lite (cache %d dias), com as tabelas dos RIRs como reserva",
-                             web.getint("geo_cache_days"))
-                except (core.sqlite3.Error, OSError) as e:
-                    log.error("geo: nao foi possivel abrir o cache do ipinfo: %s; usando so os RIRs", e)
-        elif provider != "rir":
-            log.warning("geo_provider desconhecido: %r (use rir ou ipinfo); usando os RIRs", provider)
+        self.geo_enabled = bool(s["geoip"])
+        if self.ipinfo is not None:
+            self.ipinfo.disabled = True  # a thread antiga fica ociosa
+            self.ipinfo = None
+        if s["geo_provider"] == "ipinfo":
+            if not s["ipinfo_token"]:
+                log.error("fonte do pais = ipinfo, mas o token esta vazio; usando so as tabelas dos RIRs")
+                return
+            try:
+                self.ipinfo = f2b_geo.IpinfoLite(
+                    s["ipinfo_token"], os.path.join(os.path.dirname(self.geo_file) or ".", "geo_cache.db"),
+                    ttl_days=int(s["geo_cache_days"]), url=self.ipinfo_url)
+                log.info("geo: pais via ipinfo Lite (cache %s dias), com as tabelas dos RIRs como reserva",
+                         s["geo_cache_days"])
+            except (core.sqlite3.Error, OSError) as e:
+                log.error("geo: nao foi possivel abrir o cache do ipinfo: %s; usando so os RIRs", e)
 
-    # -- observabilidade ----------------------------------------------------------
+    def routers(self):
+        self.refresh()
+        return list(self.agent.routers)
+
+    # -- observabilidade ------------------------------------------------------------
     def country_info(self, key):
         """{'cc', 'source', 'asn', 'as_name'} de um IP/rede. cc None = desconhecido.
 
@@ -121,7 +233,7 @@ class Panel:
         info = {"cc": None, "source": None, "asn": "", "as_name": ""}
         if entry is None:
             return info
-        if self.geo is not None and self.geo.ready:
+        if self.geo is not None and self.geo_enabled and self.geo.ready:
             cc = self.geo.lookup(entry)
             if cc:
                 info.update(cc=cc, source="rir")
@@ -136,7 +248,6 @@ class Panel:
         return info
 
     def country(self, key):
-        """Codigo ISO do pais (ou None = desconhecido)."""
         return self.country_info(key)["cc"]
 
     def _events(self, sql, args=()):
@@ -155,10 +266,11 @@ class Panel:
 
     def meta(self):
         first = self._events("SELECT MIN(ts) FROM events")
+        geo_on = self.geo is not None and self.geo_enabled
         return {"events": self.events is not None, "events_since": first[0][0] if first else None,
-                "geo": self.geo is not None, "geo_ready": bool(self.geo and self.geo.ready),
-                "geo_updated": self.geo.updated_at() if self.geo else None,
-                "geo_error": self.geo_updater.last_error if self.geo_updater else None,
+                "geo": geo_on, "geo_ready": bool(geo_on and self.geo.ready),
+                "geo_updated": self.geo.updated_at() if geo_on else None,
+                "geo_error": self.geo_updater.last_error if geo_on and self.geo_updater else None,
                 "geo_provider": "ipinfo" if self.ipinfo is not None else "rir",
                 "ipinfo": self.ipinfo.status() if self.ipinfo is not None else None}
 
@@ -230,9 +342,15 @@ class Panel:
                 "recent": [{"ts": ts, "kind": k, "ip": ip, "jail": j} for ts, k, ip, j in rows[:15]]}
 
     # -- leitura ------------------------------------------------------------------
-    def routers(self):
-        self.agent.reload_routers()
-        return list(self.agent.routers)
+    def _skip_reason(self, entry):
+        """Por que o agente nao bloqueia esta entrada (ou None se bloqueia)."""
+        if entry is None:
+            return "invalido"
+        if self.agent._whitelisted(entry):
+            return "whitelist"
+        if entry.version not in self.agent.families:
+            return "IPv6 desativado"
+        return None
 
     def _sources(self):
         """Fail2ban, blacklist e o conjunto desejado, sem tocar nos roteadores."""
@@ -247,46 +365,14 @@ class Panel:
         except core.Fail2banError as e:
             f2b.update(ok=False, error=str(e))
             per_jail, banned = {}, {}
-        bl = {"ok": True, "error": None, "file": a.blacklist_file, "entries": [], "items": []}
-        try:
-            blacklist = a._blacklist()
-            bl["entries"] = sorted(blacklist, key=sort_key)
-            bl["items"] = self.blacklist_items()
-        except core.BlacklistError as e:
-            bl.update(ok=False, error=str(e))
-            blacklist = {}
-        return f2b, bl, per_jail, blacklist, a._merge(banned, blacklist)
-
-    def _skip_reason(self, entry):
-        """Por que o agente nao bloqueia esta entrada (ou None se bloqueia)."""
-        a = self.agent
-        if entry is None:
-            return "invalido"
-        if a._whitelisted(entry):
-            return "whitelist"
-        if entry.version not in a.families:
-            return "IPv6 desativado"
-        return None
-
-    def blacklist_items(self):
-        """Linhas validas da blacklist com o comentario de cada uma."""
-        path = self.agent.blacklist_file
-        if not path or not os.path.exists(path):
-            return []
-        try:
-            with open(path, encoding="utf-8") as fh:
-                lines = fh.readlines()
-        except OSError as e:
-            raise core.BlacklistError("nao foi possivel ler a blacklist %s: %s" % (path, e))
+        blacklist = a._blacklist()
         items = []
-        for n, line in enumerate(lines, 1):
-            token, comment = core.parse_blacklist_line(line)
-            if not token:
-                continue
-            entry = core.normalize_ip(token)
-            items.append({"entry": str(entry) if entry is not None else token, "comment": comment, "line": n,
-                          "ignored": self._skip_reason(entry)})
-        return items
+        for row in self.store.blacklist():
+            entry = core.normalize_ip(row["entry"])
+            items.append(dict(row, ignored=self._skip_reason(entry)))
+        bl = {"ok": True, "error": None, "entries": sorted(blacklist, key=sort_key),
+              "items": sorted(items, key=lambda i: sort_key(i["entry"]))}
+        return f2b, bl, per_jail, blacklist, a._merge(banned, blacklist)
 
     def _query_router(self, router):
         out = public_router(router)
@@ -313,6 +399,8 @@ class Panel:
 
     def overview(self):
         a = self.agent
+        self.refresh()
+        # fontes no pool e roteadores nesta thread: em paralelo, e nenhuma tarefa do pool espera outra
         sources_future = self.pool.submit(self._sources)
         routers = self._query_routers()
         f2b, bl, per_jail, blacklist, desired = sources_future.result()
@@ -376,8 +464,7 @@ class Panel:
             del r["rows"]
 
         return {"generated_at": time.strftime("%Y-%m-%d %H:%M:%S"), "version": core.__version__,
-                "list_name": a.list_name,
-                "families": a.families, "fail2ban": f2b, "blacklist": bl,
+                "list_name": a.list_name, "families": a.families, "fail2ban": f2b, "blacklist": bl,
                 "whitelist": [str(n) for n in a.whitelist], "desired_count": len(desired),
                 "routers": routers, "entries": entries, "agent_service": service_state("f2b-mikrotik"),
                 "meta": self.meta()}
@@ -387,7 +474,7 @@ class Panel:
         if target is None:
             raise ApiError(400, "informe um IP ou rede valido (ex.: 203.0.113.5 ou 198.51.100.0/24)")
         a = self.agent
-        # fontes no pool e roteadores nesta thread: nenhuma tarefa do pool espera por outra (sem deadlock)
+        self.refresh()
         sources_future = self.pool.submit(self._sources)
         routers = self._query_routers()
         f2b, bl, per_jail, blacklist, desired = sources_future.result()
@@ -407,10 +494,14 @@ class Panel:
                 if rel:
                     result["fail2ban"]["matches"].append({"jail": jail, "entry": raw, "relation": rel,
                                                           "replicated": not a.f2b.jails or jail in a.f2b.jails})
+        bl_rows = {r["entry"]: r for r in self.store.blacklist()}
         for key, (entry, _tags) in sorted(blacklist.items()):
             rel = relation(target, entry)
             if rel:
-                result["blacklist"]["matches"].append({"entry": key, "relation": rel})
+                row = bl_rows.get(key, {})
+                result["blacklist"]["matches"].append({"entry": key, "relation": rel,
+                                                       "expires_at": row.get("expires_at"),
+                                                       "comment": row.get("comment", "")})
         for key, (entry, tags) in sorted(desired.items()):
             rel = relation(target, entry)
             if rel:
@@ -443,8 +534,8 @@ class Panel:
             return {"file": self.agent_log, "lines": [], "error": str(e)}
         return {"file": self.agent_log, "lines": data[-lines:], "error": None}
 
-    # -- acoes: unban e blacklist ---------------------------------------------------
-    def unban(self, data, who):
+    # -- acoes: unban, blacklist e whitelist ----------------------------------------
+    def unban(self, data, who, ip):
         try:
             target = ipaddress.ip_address(str(data.get("ip", "")).strip())
         except ValueError:
@@ -464,47 +555,17 @@ class Panel:
                     try:
                         f2b.unban(raw, jail)
                     except core.Fail2banError as e:
+                        self.store.audit(who, "fail2ban.unban_falhou", str(target), {"jail": jail, "erro": str(e)}, ip)
                         raise ApiError(502, "falha ao desbanir de %s: %s" % (jail, e))
                     done.append(jail)
         if not done:
             raise ApiError(404, "%s nao esta banido %s" % (target, "na jail " + jail_filter if jail_filter
                                                               else "no fail2ban"))
-        log.info("unban por %s: %s (jails: %s)", who, target, ", ".join(done))
-        try:
-            in_blacklist = any(relation(target, e) in ("igual", "dentro")
-                               for e, _ in self.agent._blacklist().values())
-        except core.BlacklistError:
-            in_blacklist = False
+        self.store.audit(who, "fail2ban.unban", str(target), {"jails": done}, ip)
+        in_blacklist = any(relation(target, e) in ("igual", "dentro") for e, _ in self.agent._blacklist().values())
         return {"ip": str(target), "jails": done, "in_blacklist": in_blacklist}
 
-    def _blacklist_path(self):
-        path = self.agent.blacklist_file
-        if not path:
-            raise ApiError(409, "a blacklist esta desativada no config.ini ([blacklist] file)")
-        return path
-
-    def _write_blacklist(self, path, lines):
-        mode = 0o644
-        try:
-            mode = os.stat(path).st_mode & 0o777
-        except OSError:
-            pass
-        tmp = path + ".tmp"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.writelines(lines)
-        os.replace(tmp, path)
-
-    def _read_blacklist(self, path):
-        try:
-            with open(path, encoding="utf-8") as fh:
-                return fh.readlines()
-        except FileNotFoundError:
-            return ["# Blacklist do f2b-mikrotik: um IP ou rede por linha\n"]
-        except OSError as e:
-            raise ApiError(500, "nao foi possivel ler %s: %s" % (path, e))
-
-    def blacklist_add(self, data, who):
+    def blacklist_add(self, data, who, ip):
         entry = core.normalize_ip(str(data.get("entry", "")).strip())
         if entry is None:
             raise ApiError(400, "informe um IP ou rede valido (ex.: 203.0.113.5 ou 198.51.100.0/24)")
@@ -516,108 +577,80 @@ class Panel:
             raise ApiError(400, "%s esta na whitelist (%s); o agente nao o bloquearia" % (entry, ", ".join(nets)))
         if reason:
             raise ApiError(400, "%s nao seria bloqueado: %s" % (entry, reason))
-        comment = re.sub(r"[\r\n#]+", " ", str(data.get("comment") or "")).strip()[:100]
-        stamp = time.strftime("%Y-%m-%d %H:%M")
-        note = "%s (%s, %s)" % (comment, who.split("@")[0], stamp) if comment else "%s, %s" % (who.split("@")[0], stamp)
-        path = self._blacklist_path()
+        try:
+            expires = int(data.get("expires") or 0)
+        except (TypeError, ValueError):
+            expires = -1
+        if expires not in EXPIRY_CHOICES:
+            raise ApiError(400, "validade invalida")
         with self.write_lock:
-            lines = self._read_blacklist(path)
-            for line in lines:
-                token, _ = core.parse_blacklist_line(line)
-                if token and str(core.normalize_ip(token)) == str(entry):
-                    raise ApiError(409, "%s ja esta na blacklist" % entry)
-            if lines and not lines[-1].endswith("\n"):
-                lines[-1] += "\n"
-            lines.append("%-24s # %s\n" % (entry, note))
-            self._write_blacklist(path, lines)
-        log.info("blacklist: %s incluido por %s", entry, who)
+            self.store.list_add("blacklist", entry, data.get("comment"), who, ip,
+                                expires_at=int(time.time()) + expires if expires else None)
+        self.refresh(force=True)
         return {"entry": str(entry)}
 
-    def blacklist_remove(self, data, who):
+    def blacklist_remove(self, data, who, ip):
         entry = core.normalize_ip(str(data.get("entry", "")).strip())
         if entry is None:
             raise ApiError(400, "entrada invalida")
-        path = self._blacklist_path()
         with self.write_lock:
-            lines = self._read_blacklist(path)
-            keep = [l for l in lines if str(core.normalize_ip(core.parse_blacklist_line(l)[0] or "-")) != str(entry)]
-            removed = len(lines) - len(keep)
-            if not removed:
-                raise ApiError(404, "%s nao esta na blacklist" % entry)
-            self._write_blacklist(path, keep)
-        log.info("blacklist: %s removido por %s", entry, who)
-        return {"entry": str(entry), "removed": removed}
+            self.store.list_remove("blacklist", entry, who, ip)
+        self.refresh(force=True)
+        return {"entry": str(entry)}
 
-    # -- cadastro de roteadores -----------------------------------------------------
-    def _validate(self, data, current=None):
-        if not isinstance(data, dict):
-            raise ApiError(400, "corpo invalido")
+    def whitelist_add(self, data, who, ip):
+        entry = core.normalize_ip(str(data.get("entry", "")).strip())
+        if entry is None:
+            raise ApiError(400, "informe um IP ou rede valido (ex.: 200.200.200.10 ou 10.0.0.0/8)")
+        if core.is_network(entry) and entry.prefixlen < (8 if entry.version == 4 else 16):
+            raise ApiError(400, "rede grande demais (/%d): o agente deixaria de bloquear boa parte da internet"
+                           % entry.prefixlen)
+        with self.write_lock:
+            self.store.list_add("whitelist", entry, data.get("comment"), who, ip)
+        self.refresh(force=True)
+        # o que deixa de ser bloqueado por causa da nova entrada
+        released = [r["entry"] for r in self.store.blacklist() if relation(core.normalize_ip(r["entry"]), entry)]
+        return {"entry": str(entry), "blacklist_ignored": released}
 
-        def text(field, required=True, limit=128):
-            value = data.get(field, current.get(field) if current else "")
-            value = "" if value is None else str(value).strip()
-            if required and not value:
-                raise ApiError(400, "campo obrigatorio: %s" % field)
-            if len(value) > limit:
-                raise ApiError(400, "campo muito longo: %s" % field)
-            return value
+    def whitelist_remove(self, data, who, ip):
+        entry = core.normalize_ip(str(data.get("entry", "")).strip())
+        if entry is None:
+            raise ApiError(400, "entrada invalida")
+        client = core.normalize_ip(ip)
+        if client is not None and relation(client, entry) in ("igual", "dentro") and not data.get("confirm"):
+            raise ApiError(409, "%s inclui o seu IP atual (%s). Sem ela, se o fail2ban banir o seu IP, os "
+                                "MikroTiks bloqueiam o seu acesso. Confirme para remover." % (entry, ip),
+                           {"needs_confirm": True})
+        with self.write_lock:
+            self.store.list_remove("whitelist", entry, who, ip)
+        self.refresh(force=True)
+        return {"entry": str(entry)}
 
-        use_ssl = bool(data.get("use_ssl", current["use_ssl"] if current else False))
-        host = text("host")
-        if not HOST_RE.match(host):
-            raise ApiError(400, "host invalido")
+    # -- roteadores -----------------------------------------------------------------
+    def _router_or_404(self, rid):
         try:
-            port = int(data.get("port") or (current["port"] if current else (8729 if use_ssl else 8728)))
-            timeout = float(data.get("timeout") or (current["timeout"] if current else 10))
-        except (TypeError, ValueError):
-            raise ApiError(400, "porta ou timeout invalido")
-        if not 1 <= port <= 65535 or not 1 <= timeout <= 60:
-            raise ApiError(400, "porta (1-65535) ou timeout (1-60 s) fora do intervalo")
-        password = data.get("password") or ""
-        if not password:
-            if current is None:
-                raise ApiError(400, "campo obrigatorio: password")
-            password = current["password"]  # em branco na edicao = manter a senha atual
-        return dict(id=current["id"] if current else secrets.token_hex(4), name=text("name", limit=40),
-                    host=host, port=port, username=text("username", limit=64), password=str(password),
-                    use_ssl=use_ssl, timeout=timeout,
-                    enabled=bool(data.get("enabled", current["enabled"] if current else True)), primary=False)
+            return self.store.get_router(rid)
+        except f2b_store.StoreError as e:
+            raise ApiError(e.status, str(e))
 
-    def _save(self, routers):
-        if not self.agent.routers_file:
-            raise ApiError(409, "routers_file esta vazio no config.ini; cadastro de roteadores desativado")
-        core.write_routers_file(self.agent.routers_file, routers)
-        self.agent.reload_routers()
-
-    def _find(self, routers, rid):
-        for r in routers:
-            if r["id"] == rid:
-                if r.get("primary"):
-                    raise ApiError(403, "o roteador principal e definido no config.ini; edite-o la")
-                return r
-        raise ApiError(404, "roteador nao encontrado")
-
-    def create_router(self, data, who):
+    def create_router(self, data, who, ip):
         with self.write_lock:
-            routers = self.routers()
-            new = self._validate(data)
-            self._save(routers + [new])
-        log.info("roteador cadastrado por %s: %s (%s:%s)", who, new["name"], new["host"], new["port"])
-        return public_router(new)
+            router = self.store.validate_router(data)
+            self.store.save_router(router, who, ip, created=True)
+        self.refresh(force=True)
+        log.info("roteador cadastrado por %s: %s (%s:%s)", who, router["name"], router["host"], router["port"])
+        return public_router(router)
 
-    def update_router(self, rid, data, who):
+    def update_router(self, rid, data, who, ip):
         with self.write_lock:
-            routers = self.routers()
-            cur = self._find(routers, rid)
-            new = self._validate(data, cur)
-            self._save([new if r["id"] == rid else r for r in routers])
-        log.info("roteador alterado por %s: %s (%s:%s)", who, new["name"], new["host"], new["port"])
-        return public_router(new)
+            router = self.store.validate_router(data, self._router_or_404(rid))
+            self.store.save_router(router, who, ip)
+        self.refresh(force=True)
+        return public_router(router)
 
-    def delete_router(self, rid, flush, who):
+    def delete_router(self, rid, flush, who, ip):
         with self.write_lock:
-            routers = self.routers()
-            cur = self._find(routers, rid)
+            cur = self._router_or_404(rid)
             removed = 0
             if flush:
                 try:
@@ -627,54 +660,66 @@ class Panel:
                             api.talk([core.LIST_PATHS[fam] + "/remove", "=.id=" + entry_id])
                             removed += 1
                 except (core.RouterOSError, OSError) as e:
+                    self.store.audit(who, "roteador.limpeza_falhou", cur["name"], {"erro": str(e)}, ip)
                     raise ApiError(502, "nao foi possivel limpar os bloqueios em %s (%s); o roteador nao foi "
                                         "excluido. Tente de novo ou exclua sem limpar." % (cur["name"], e))
-            self._save([r for r in routers if r["id"] != rid])
-        log.info("roteador excluido por %s: %s (%d bloqueio(s) removidos)", who, cur["name"], removed)
+            self.store.delete_router(rid, who, ip, {"bloqueios_removidos": removed, "limpeza": bool(flush)})
+        self.refresh(force=True)
         return {"removed_entries": removed}
 
     def test_router(self, data):
         current = None
         if data.get("id"):
-            current = next((r for r in self.routers() if r["id"] == data["id"]), None)
-        if current is not None and current.get("primary"):
-            router = current
-        else:
-            router = self._validate(dict(data, name=data.get("name") or "teste"), current)
+            current = self._router_or_404(data["id"])
+        router = self.store.validate_router(dict(data, name=data.get("name") or (current or {}).get("name") or "teste"),
+                                            current) if (current is None or len(data) > 1) else current
         out = self._query_router(dict(router, enabled=True))
         out["entries"] = len(out.pop("rows"))
         return out
 
+    # -- configuracoes, usuarios e auditoria ---------------------------------------
+    def settings(self):
+        return {"values": self.store.public_settings(),
+                "schema": {k: {"type": v[0], "min": v[2] if v[0] in ("int", "float") else None,
+                               "max": v[3] if v[0] in ("int", "float") else None,
+                               "options": list(v[2]) if v[0] == "choice" else None, "label": v[4]}
+                           for k, v in f2b_store.SETTINGS.items()},
+                "whitelist": self.store.whitelist(),
+                "readonly": {"address_list": self.agent.list_name, "comment_prefix": self.agent.prefix,
+                             "fail2ban_log": self.agent.f2b_log, "config_db": self.store.path,
+                             "events_db": self.agent.events_db}}
 
-def sort_key(key):
-    entry = core.normalize_ip(key)
-    if entry is None:
-        return (9, 0, key)
-    addr = entry.network_address if core.is_network(entry) else entry
-    return (entry.version, int(addr), key)
+    def update_settings(self, data, who, ip):
+        with self.write_lock:
+            diff = self.store.update_settings(data.get("values") or {}, who, ip)
+        self.refresh(force=True)
+        return {"changed": sorted(diff)}
 
 
-def service_state(name):
+def _err(fn, *args, **kwargs):
+    """Converte StoreError em ApiError."""
     try:
-        p = subprocess.run(["systemctl", "is-active", name], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                           universal_newlines=True, timeout=5)
-        return p.stdout.strip() or "desconhecido"
-    except (OSError, subprocess.TimeoutExpired):
-        return "desconhecido"
+        return fn(*args, **kwargs)
+    except f2b_store.StoreError as e:
+        raise ApiError(e.status, str(e))
 
 
+# --------------------------------------------------------------------------- #
+# HTTP
+# --------------------------------------------------------------------------- #
 class Handler(BaseHTTPRequestHandler):
     server_version = "f2b-web"
     sys_version = ""
     panel = None
-    username = ""
-    password = ""
+    sessions = Sessions()
+    limiter = LoginLimiter()
+    secure_cookie = False
 
     def log_message(self, fmt, *args):
         log.debug("%s %s", self.client_address[0], fmt % args)
 
     # -- respostas ----------------------------------------------------------------
-    def _headers(self, status, ctype, length):
+    def _headers(self, status, ctype, length, extra=None):
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(length))
@@ -683,32 +728,39 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'")
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
 
-    def _json(self, status, data):
-        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
-        self._headers(status, "application/json; charset=utf-8", len(body))
+    def _send(self, status, body, ctype, extra=None):
+        self._headers(status, ctype, len(body), extra)
         self.end_headers()
-        self.wfile.write(body)
+        if self.command != "HEAD":
+            self.wfile.write(body)
 
-    def _authorized(self):
-        header = self.headers.get("Authorization", "")
-        if header.startswith("Basic "):
-            try:
-                user, _, pwd = base64.b64decode(header[6:]).decode("utf-8").partition(":")
-            except (ValueError, UnicodeDecodeError):
-                user = pwd = ""
-            ok_user = hmac.compare_digest(user.encode(), self.username.encode())
-            ok_pwd = hmac.compare_digest(pwd.encode(), self.password.encode())
-            if ok_user and ok_pwd:
-                return True
-            log.warning("login invalido de %s (usuario %r)", self.client_address[0], user)
-            time.sleep(1)  # freia tentativas de forca bruta
-        body = b"autenticacao necessaria"
-        self._headers(401, "text/plain; charset=utf-8", len(body))
-        self.send_header("WWW-Authenticate", 'Basic realm="f2b-mikrotik", charset="UTF-8"')
-        self.end_headers()
-        self.wfile.write(body)
-        return False
+    def _json(self, status, data, extra=None):
+        self._send(status, json.dumps(data, ensure_ascii=False).encode("utf-8"),
+                   "application/json; charset=utf-8", extra)
+
+    def _static(self, name, ctype):
+        try:
+            with open(os.path.join(STATIC_DIR, name), "rb") as fh:
+                body = fh.read()
+        except OSError:
+            raise ApiError(404, "arquivo %s nao encontrado" % name)
+        self._send(200, body, ctype)
+
+    def _cookie_token(self):
+        for part in self.headers.get("Cookie", "").split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == COOKIE:
+                return v
+        return None
+
+    def _set_cookie(self, token, clear=False):
+        attrs = "Path=/; HttpOnly; SameSite=Strict" + ("; Secure" if self.secure_cookie else "")
+        if clear:
+            return {"Set-Cookie": "%s=; Max-Age=0; %s" % (COOKIE, attrs)}
+        return {"Set-Cookie": "%s=%s; %s" % (COOKIE, token, attrs)}
 
     def _body(self):
         # exige cabecalho proprio e JSON: um site de terceiros nao consegue forjar o pedido (CSRF)
@@ -719,82 +771,250 @@ class Handler(BaseHTTPRequestHandler):
         if length > MAX_BODY:
             raise ApiError(413, "corpo muito grande")
         try:
-            return json.loads(self.rfile.read(length) or b"{}")
+            data = json.loads(self.rfile.read(length) or b"{}")
         except ValueError:
             raise ApiError(400, "JSON invalido")
+        if not isinstance(data, dict):
+            raise ApiError(400, "JSON invalido")
+        return data
 
-    def _who(self):
-        return "%s@%s" % (self.username, self.client_address[0])
+    @property
+    def ip(self):
+        return self.client_address[0]
+
+    # -- autenticacao -------------------------------------------------------------
+    def _current_user(self):
+        username = self.sessions.get(self._cookie_token())
+        if not username:
+            return None
+        user = self.panel.store.get_user(username)
+        if user is None or not user["enabled"]:
+            self.sessions.drop(self._cookie_token())
+            return None
+        return user
+
+    def _login(self):
+        data = self._body()
+        wait = self.limiter.blocked_for(self.ip)
+        if wait:
+            self.panel.store.audit(str(data.get("username", ""))[:40] or "?", "login.bloqueado", "",
+                                   {"motivo": "muitas tentativas"}, self.ip)
+            raise ApiError(429, "muitas tentativas de login; tente de novo em %d min" % (wait // 60 + 1))
+        user = self.panel.store.authenticate(data.get("username"), data.get("password"))
+        if user is None:
+            self.limiter.fail(self.ip)
+            self.panel.store.audit(str(data.get("username", ""))[:40] or "?", "login.falha", "", None, self.ip)
+            log.warning("login invalido de %s (usuario %r)", self.ip, data.get("username"))
+            time.sleep(1)  # freia forca bruta
+            raise ApiError(401, "usuario ou senha incorretos")
+        token = self.sessions.create(user["username"])
+        self.panel.store.audit(user["username"], "login.ok", "", None, self.ip)
+        return self._json(200, self._me(user), self._set_cookie(token))
+
+    @staticmethod
+    def _me(user):
+        return {"username": user["username"], "name": user["name"], "role": user["role"],
+                "role_label": f2b_store.ROLE_LABEL[user["role"]]}
 
     # -- rotas --------------------------------------------------------------------
-    def _dispatch(self, method):
-        if not self._authorized():
-            return
+    def _dispatch(self):
         url = urlparse(self.path)
         path, query = url.path, parse_qs(url.query)
+        method = "GET" if self.command == "HEAD" else self.command
         try:
-            if method == "GET" and path in STATIC_FILES:
-                return self._static(*STATIC_FILES[path])
-            m = re.match(r"^/api/routers/([0-9a-z_-]+)$", path)
-            if method == "GET" and path == "/api/overview":
-                return self._json(200, self.panel.overview())
-            if method == "GET" and path == "/api/check":
-                return self._json(200, self.panel.check(query.get("ip", [""])[0]))
-            if method == "GET" and path == "/api/stats":
-                try:
-                    hours = int(query.get("hours", ["24"])[0])
-                except ValueError:
-                    hours = 24
-                return self._json(200, self.panel.stats(max(1, min(hours, 24 * 31))))
-            if method == "GET" and path == "/api/log":
-                lines = max(10, min(int(query.get("lines", ["300"])[0] or 300), 5000))
-                return self._json(200, self.panel.agent_log_tail(lines))
-            if method == "GET" and path == "/api/routers":
-                return self._json(200, {"routers": [public_router(r) for r in self.panel.routers()]})
-            if method == "POST" and path == "/api/routers":
-                return self._json(201, self.panel.create_router(self._body(), self._who()))
-            if method == "POST" and path == "/api/unban":
-                return self._json(200, self.panel.unban(self._body(), self._who()))
-            if method == "POST" and path == "/api/blacklist":
-                return self._json(201, self.panel.blacklist_add(self._body(), self._who()))
-            if method == "DELETE" and path == "/api/blacklist":
-                return self._json(200, self.panel.blacklist_remove(self._body(), self._who()))
-            if method == "POST" and path == "/api/routers/test":
-                return self._json(200, self.panel.test_router(self._body()))
-            if method == "PUT" and m:
-                return self._json(200, self.panel.update_router(m.group(1), self._body(), self._who()))
-            if method == "DELETE" and m:
-                self._body()  # so para validar o cabecalho anti-CSRF
-                flush = query.get("flush", ["0"])[0] == "1"
-                return self._json(200, self.panel.delete_router(m.group(1), flush, self._who()))
+            if method == "GET" and path in PUBLIC_FILES:
+                return self._static(*PUBLIC_FILES[path])
+            if method == "POST" and path == "/api/login":
+                return self._login()
+            user = self._current_user()
+            if user is None:
+                if method == "GET" and not path.startswith("/api/"):
+                    return self._send(302, b"", "text/plain", {"Location": "/login"})
+                raise ApiError(401, "sessao expirada; entre novamente")
+            if method == "GET" and path in PRIVATE_FILES:
+                return self._static(*PRIVATE_FILES[path])
+            for m, pattern, role, handler in ROUTES:
+                match = re.fullmatch(pattern, path)
+                if m == method and match:
+                    if ROLE_RANK[user["role"]] < ROLE_RANK[role]:
+                        self.panel.store.audit(user["username"], "acesso.negado", "%s %s" % (method, path), None,
+                                               self.ip)
+                        raise ApiError(403, "seu usuario (%s) nao tem permissao para isso"
+                                       % f2b_store.ROLE_LABEL[user["role"]])
+                    return handler(self, user, query, *match.groups())
             raise ApiError(404, "nao encontrado")
         except ApiError as e:
+            self._json(e.status, dict({"error": str(e)}, **e.extra))
+        except f2b_store.StoreError as e:
             self._json(e.status, {"error": str(e)})
         except Exception as e:
             log.exception("erro em %s %s", method, path)
             self._json(500, {"error": "erro interno: %s" % e})
 
-    def _static(self, name, ctype):
+    do_GET = do_HEAD = do_POST = do_PUT = do_DELETE = _dispatch
+
+    # -- manipuladores (self, user, query, *grupos) ---------------------------------
+    def h_logout(self, user, _q):
+        self._body()
+        self.sessions.drop(self._cookie_token())
+        self.panel.store.audit(user["username"], "logout", "", None, self.ip)
+        return self._json(200, {"ok": True}, self._set_cookie("", clear=True))
+
+    def h_me(self, user, _q):
+        return self._json(200, self._me(user))
+
+    def h_password(self, user, _q):
+        data = self._body()
+        _err(self.panel.store.change_own_password, user["username"], data.get("current"), data.get("new"), self.ip)
+        self.sessions.drop_user(user["username"], keep=self._cookie_token())  # derruba outras sessoes
+        return self._json(200, {"ok": True})
+
+    def h_overview(self, _u, _q):
+        return self._json(200, self.panel.overview())
+
+    def h_check(self, _u, q):
+        return self._json(200, self.panel.check(q.get("ip", [""])[0]))
+
+    def h_stats(self, _u, q):
         try:
-            with open(os.path.join(STATIC_DIR, name), "rb") as fh:
-                body = fh.read()
-        except OSError:
-            raise ApiError(404, "arquivo %s nao encontrado" % name)
-        self._headers(200, ctype, len(body))
-        self.end_headers()
-        self.wfile.write(body)
+            hours = int(q.get("hours", ["24"])[0])
+        except ValueError:
+            hours = 24
+        return self._json(200, self.panel.stats(max(1, min(hours, 24 * 31))))
 
-    def do_GET(self):
-        self._dispatch("GET")
+    def h_log(self, _u, q):
+        try:
+            lines = int(q.get("lines", ["300"])[0] or 300)
+        except ValueError:
+            lines = 300
+        return self._json(200, self.panel.agent_log_tail(max(10, min(lines, 5000))))
 
-    def do_POST(self):
-        self._dispatch("POST")
+    def h_unban(self, user, _q):
+        return self._json(200, self.panel.unban(self._body(), user["username"], self.ip))
 
-    def do_PUT(self):
-        self._dispatch("PUT")
+    def h_bl_add(self, user, _q):
+        return self._json(201, _err(self.panel.blacklist_add, self._body(), user["username"], self.ip))
 
-    def do_DELETE(self):
-        self._dispatch("DELETE")
+    def h_bl_del(self, user, _q):
+        return self._json(200, _err(self.panel.blacklist_remove, self._body(), user["username"], self.ip))
+
+    def h_wl_add(self, user, _q):
+        return self._json(201, _err(self.panel.whitelist_add, self._body(), user["username"], self.ip))
+
+    def h_wl_del(self, user, _q):
+        return self._json(200, _err(self.panel.whitelist_remove, self._body(), user["username"], self.ip))
+
+    def h_routers(self, _u, _q):
+        return self._json(200, {"routers": [public_router(r) for r in self.panel.routers()]})
+
+    def h_router_add(self, user, _q):
+        return self._json(201, _err(self.panel.create_router, self._body(), user["username"], self.ip))
+
+    def h_router_test(self, _u, _q):
+        return self._json(200, _err(self.panel.test_router, self._body()))
+
+    def h_router_put(self, user, _q, rid):
+        return self._json(200, _err(self.panel.update_router, rid, self._body(), user["username"], self.ip))
+
+    def h_router_del(self, user, q, rid):
+        self._body()
+        flush = q.get("flush", ["0"])[0] == "1"
+        return self._json(200, _err(self.panel.delete_router, rid, flush, user["username"], self.ip))
+
+    def h_settings(self, _u, _q):
+        return self._json(200, self.panel.settings())
+
+    def h_settings_put(self, user, _q):
+        return self._json(200, _err(self.panel.update_settings, self._body(), user["username"], self.ip))
+
+    def h_users(self, _u, _q):
+        return self._json(200, {"users": self.panel.store.users(), "roles": f2b_store.ROLE_LABEL})
+
+    def h_user_add(self, user, _q):
+        _err(self.panel.store.create_user, self._body(), user["username"], self.ip)
+        return self._json(201, {"ok": True})
+
+    def h_user_put(self, user, _q, username):
+        data = self._body()
+        diff = _err(self.panel.store.update_user, username, data, user["username"], self.ip)
+        if diff and ("ativo" in diff or "papel" in diff or "senha" in diff):
+            # perdeu acesso, mudou de papel ou teve a senha redefinida: derruba as sessoes dele
+            keep = self._cookie_token() if username.lower() == user["username"].lower() else None
+            self.sessions.drop_user(username, keep=keep)
+        return self._json(200, {"changed": sorted(diff)})
+
+    def h_user_del(self, user, _q, username):
+        self._body()
+        _err(self.panel.store.delete_user, username, user["username"], self.ip)
+        self.sessions.drop_user(username)
+        return self._json(200, {"ok": True})
+
+    def _audit_filters(self, q):
+        def first(k):
+            return (q.get(k, [""])[0] or "").strip()
+        since = until = None
+        try:
+            if first("since"):
+                since = int(first("since"))
+            if first("until"):
+                until = int(first("until"))
+        except ValueError:
+            raise ApiError(400, "periodo invalido")
+        return dict(actor=first("actor"), action=first("action"), text=first("text"), since=since, until=until)
+
+    def h_audit(self, _u, q):
+        limit = 200
+        before = q.get("before", [""])[0]
+        rows = self.panel.store.audit_query(limit=limit + 1, before_id=int(before) if before.isdigit() else None,
+                                            **self._audit_filters(q))
+        actors = [r["actor"] for r in self.panel.store.query("SELECT DISTINCT actor FROM audit ORDER BY actor")]
+        return self._json(200, {"rows": rows[:limit], "more": len(rows) > limit, "actors": actors})
+
+    def h_audit_csv(self, user, q):
+        filters = self._audit_filters(q)
+        rows = self.panel.store.audit_query(limit=100000, **filters)
+        buf = io.StringIO()
+        w = csv.writer(buf, delimiter=";")
+        w.writerow(["id", "data_hora", "usuario", "ip", "acao", "alvo", "detalhes"])
+        for r in rows:
+            w.writerow([r["id"], time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(r["ts"])), r["actor"], r["ip"],
+                        r["action"], r["target"],
+                        json.dumps(r["details"], ensure_ascii=False) if r["details"] else ""])
+        self.panel.store.audit(user["username"], "auditoria.exportada", "%d registro(s)" % len(rows),
+                               {k: v for k, v in filters.items() if v}, self.ip)
+        body = ("\ufeff" + buf.getvalue()).encode("utf-8")  # BOM: o Excel abre os acentos certos
+        return self._send(200, body, "text/csv; charset=utf-8",
+                          {"Content-Disposition": "attachment; filename=auditoria-%s.csv" % time.strftime("%Y%m%d-%H%M")})
+
+
+# (metodo, rota, papel minimo, manipulador)
+ROUTES = [
+    ("POST", r"/api/logout", "leitura", Handler.h_logout),
+    ("GET", r"/api/me", "leitura", Handler.h_me),
+    ("POST", r"/api/me/password", "leitura", Handler.h_password),
+    ("GET", r"/api/overview", "leitura", Handler.h_overview),
+    ("GET", r"/api/check", "leitura", Handler.h_check),
+    ("GET", r"/api/stats", "leitura", Handler.h_stats),
+    ("GET", r"/api/log", "leitura", Handler.h_log),
+    ("POST", r"/api/unban", "operador", Handler.h_unban),
+    ("POST", r"/api/blacklist", "operador", Handler.h_bl_add),
+    ("DELETE", r"/api/blacklist", "operador", Handler.h_bl_del),
+    ("POST", r"/api/whitelist", "admin", Handler.h_wl_add),
+    ("DELETE", r"/api/whitelist", "admin", Handler.h_wl_del),
+    ("GET", r"/api/routers", "leitura", Handler.h_routers),
+    ("POST", r"/api/routers", "admin", Handler.h_router_add),
+    ("POST", r"/api/routers/test", "admin", Handler.h_router_test),
+    ("PUT", r"/api/routers/([0-9A-Za-z_-]+)", "admin", Handler.h_router_put),
+    ("DELETE", r"/api/routers/([0-9A-Za-z_-]+)", "admin", Handler.h_router_del),
+    ("GET", r"/api/settings", "admin", Handler.h_settings),
+    ("PUT", r"/api/settings", "admin", Handler.h_settings_put),
+    ("GET", r"/api/users", "admin", Handler.h_users),
+    ("POST", r"/api/users", "admin", Handler.h_user_add),
+    ("PUT", r"/api/users/([A-Za-z0-9._@-]+)", "admin", Handler.h_user_put),
+    ("DELETE", r"/api/users/([A-Za-z0-9._@-]+)", "admin", Handler.h_user_del),
+    ("GET", r"/api/audit", "admin", Handler.h_audit),
+    ("GET", r"/api/audit\.csv", "admin", Handler.h_audit_csv),
+]
 
 
 def main():
@@ -807,19 +1027,15 @@ def main():
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-    core.log.addHandler(logging.NullHandler())  # avisos do agente aparecem no proprio painel
+    core.log.addHandler(logging.StreamHandler())  # migracao e erros do agente aparecem no journal do painel
+    core.log.setLevel(logging.INFO)
     core.log.propagate = False
 
     cfg = core.load_config(args.config)
     web = cfg["web"]
     bind = args.bind or web.get("bind").strip() or "0.0.0.0"
     port = args.port or web.getint("port")
-    if not web.get("password", "").strip():
-        raise SystemExit("defina [web] password no %s antes de iniciar o painel" % args.config)
-
     Handler.panel = Panel(cfg)
-    Handler.username = web.get("username").strip() or "admin"
-    Handler.password = web.get("password").strip()
 
     try:
         server = ThreadingHTTPServer((bind, port), Handler)
@@ -834,6 +1050,8 @@ def main():
         ctx.load_cert_chain(cert, key or None)
         server.socket = ctx.wrap_socket(server.socket, server_side=True)
         scheme = "https"
+        Handler.secure_cookie = True
+    Handler.panel.store.audit("sistema", "painel.iniciado", "%s://%s:%s" % (scheme, bind, port), None)
     log.info("f2b-mikrotik web %s em %s://%s:%s/", core.__version__, scheme, bind, port)
     try:
         server.serve_forever()

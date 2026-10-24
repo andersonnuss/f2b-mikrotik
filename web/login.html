@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Entrar · f2b-mikrotik</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body class="login-page">
+  <main class="login-box card">
+    <div class="brand">
+      <svg class="logo" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2 4 5v6c0 5 3.4 9.3 8 11 4.6-1.7 8-6 8-11V5l-8-3Zm-1 13-3.5-3.5 1.4-1.4L11 12.2l4.6-4.6 1.4 1.4L11 15Z"/></svg>
+      <span>f2b-mikrotik</span>
+    </div>
+    <form id="login-form" autocomplete="on">
+      <label>Usuário<input name="username" autocomplete="username" required autofocus></label>
+      <label>Senha<input name="password" type="password" autocomplete="current-password" required></label>
+      <div id="login-error" aria-live="polite"></div>
+      <button class="btn primary" type="submit">Entrar</button>
+    </form>
+  </main>
+  <script src="login.js"></script>
+</body>
+</html>

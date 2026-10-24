@@ -51,7 +51,9 @@ import sys
 import threading
 import time
 
-__version__ = "1.5.0"
+import f2b_store
+
+__version__ = "2.0.0"
 
 log = logging.getLogger("f2b-mikrotik")
 
@@ -486,75 +488,115 @@ def read_routers_file(path):
     return routers
 
 
-def write_routers_file(path, routers):
-    """Grava os roteadores adicionais de forma atomica e com permissao 600 (contem senhas)."""
-    data = {"routers": [{k: r[k] for k in ROUTER_FIELDS} for r in routers if not r.get("primary")]}
-    tmp = path + ".tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump(data, fh, indent=2, ensure_ascii=False)
-    os.replace(tmp, path)
+def legacy_config(cfg):
+    """Configuracao das versoes anteriores (config.ini, routers.json, blacklist.txt) para a migracao."""
+    mk, f2b, ag, web = cfg["mikrotik"], cfg["fail2ban"], cfg["agent"], cfg["web"]
+    out = {"settings": {}, "routers": [], "blacklist": [], "whitelist": [],
+           "admin_password": web.get("password", "").strip()}
+    sources = {"sync_interval": (ag, "sync_interval"), "debounce": (ag, "debounce"),
+               "retry_delay": (ag, "retry_delay"), "entry_timeout": (mk, "entry_timeout"), "ipv6": (mk, "ipv6"),
+               "jails": (f2b, "jails"), "events_retention_days": (ag, "events_retention_days"),
+               "geoip": (web, "geoip"), "geo_provider": (web, "geo_provider"),
+               "ipinfo_token": (web, "ipinfo_token"), "geo_cache_days": (web, "geo_cache_days")}
+    for key, (section, option) in sources.items():
+        if section.get(option) is not None:
+            out["settings"][key] = section.get(option).strip()
+    if mk.get("host", "").strip() and mk.get("username", "").strip() and mk.get("password", "").strip():
+        out["routers"].append(dict(id=PRIMARY_ID, name=mk.get("name", "").strip() or PRIMARY_ID,
+                                   host=mk.get("host").strip(), port=mk.getint("port"),
+                                   username=mk.get("username").strip(), password=mk.get("password").strip(),
+                                   use_ssl=mk.getboolean("use_ssl"), timeout=mk.getfloat("timeout"), enabled=True))
+    routers_file = ag.get("routers_file", "").strip()
+    if routers_file:
+        try:
+            out["routers"] += [r for r in read_routers_file(routers_file) if r["id"] != PRIMARY_ID]
+        except RoutersFileError as e:
+            log.warning("migracao: %s", e)
+    bl_file = cfg["blacklist"].get("file", "").strip()
+    if bl_file and os.path.exists(bl_file):
+        try:
+            with open(bl_file, encoding="utf-8") as fh:
+                for line in fh:
+                    token, comment = parse_blacklist_line(line)
+                    entry = normalize_ip(token) if token else None
+                    if entry is not None:
+                        out["blacklist"].append((str(entry), comment))
+        except OSError as e:
+            log.warning("migracao: nao foi possivel ler %s: %s", bl_file, e)
+    for item in parse_list(f2b.get("whitelist")):
+        entry = normalize_ip(item)
+        if entry is not None:
+            out["whitelist"].append((str(entry), ""))
+    return out
 
 
 class Agent:
     def __init__(self, cfg, dry_run=False):
         mk, f2b, ag = cfg["mikrotik"], cfg["fail2ban"], cfg["agent"]
-        self.primary = dict(id=PRIMARY_ID, name=mk.get("name").strip() or PRIMARY_ID, host=mk.get("host"),
-                            port=mk.getint("port"), username=mk.get("username"), password=mk.get("password"),
-                            use_ssl=mk.getboolean("use_ssl"), timeout=mk.getfloat("timeout"),
-                            enabled=True, primary=True)
         self.list_name = mk.get("address_list")
         self.prefix = mk.get("comment_prefix")
-        self.entry_timeout = mk.get("entry_timeout").strip()
-        self.families = [4, 6] if mk.getboolean("ipv6") else [4]
-        self.f2b = Fail2ban(f2b.get("client"), parse_list(f2b.get("jails")))
+        self.f2b_client = f2b.get("client")
         self.f2b_log = f2b.get("logfile").strip()
-        self.whitelist = [ipaddress.ip_network(n, strict=False) for n in parse_list(f2b.get("whitelist"))]
-        self.blacklist_file = cfg["blacklist"].get("file").strip()
-        self.routers_file = ag.get("routers_file").strip()
         self.events_db = ag.get("events_db").strip()
-        self.events_retention = ag.getint("events_retention_days")
         self.events = None
         self._last_f2b = None
-        self.sync_interval = ag.getfloat("sync_interval")
-        self.debounce = ag.getfloat("debounce")
-        self.retry_delay = ag.getfloat("retry_delay")
         self.dry_run = dry_run
-        self.routers = [self.primary]
-        self._routers_sig = None
-        self._routers_loaded = False
         self._ignored_logged = set()
         self._errors = {}
         self._stop = False
-        self.reload_routers()
+        # configuracao editavel pelo painel: banco SQLite (migrado das versoes anteriores na 1a vez)
+        self.store = f2b_store.ConfigStore(ag.get("config_db").strip())
+        result = self.store.migrate(legacy_config(cfg))
+        if result is not None:
+            log.info("configuracao migrada para %s: %s", self.store.path, result["summary"])
+            log.info("a partir de agora roteadores, blacklist, whitelist e configuracoes sao editados no painel; "
+                     "routers.json, blacklist.txt e as opcoes antigas do config.ini deixam de ser usados")
+            if result["generated_admin_password"]:
+                log.warning("[web] password estava vazio: o usuario admin foi criado com senha aleatoria. "
+                            "Defina uma com: f2b_mikrotik.py --reset-password admin")
+        self._data_version = None
+        self._config_sig = None
+        self.reload(force=True)
 
-    # -- roteadores ---------------------------------------------------------------
-    def reload_routers(self):
-        """Rele o routers.json se ele mudou. Retorna True se a lista mudou.
-        Se o arquivo estiver invalido, mantem a lista anterior."""
-        if not self.routers_file:
+    # -- configuracao do banco ------------------------------------------------------
+    def reload(self, force=False):
+        """Rele a configuracao do banco quando o painel a altera. Retorna True se algo relevante mudou."""
+        version = self.store.data_version()
+        if not force and version == self._data_version:
             return False
-        sig = file_signature(self.routers_file)
-        if sig == self._routers_sig:
+        self._data_version = version
+        settings = self.store.settings()
+        routers = self.store.routers()
+        whitelist = [r["entry"] for r in self.store.whitelist()]
+        blacklist = [(r["entry"], r["expires_at"]) for r in self.store.blacklist()]
+        sig = json.dumps([settings, routers, whitelist, blacklist], sort_keys=True, default=str)
+        if sig == self._config_sig:
             return False
-        self._routers_sig = sig
-        try:
-            extra = read_routers_file(self.routers_file)
-        except RoutersFileError as e:
-            log.error("%s; mantendo a lista anterior de roteadores", e)
-            return False
-        routers, ids = [self.primary], {PRIMARY_ID}
-        for r in extra:
-            if r["id"] in ids:
-                log.warning("roteador com id repetido em %s ignorado: %s", self.routers_file, r["id"])
-                continue
-            ids.add(r["id"])
-            routers.append(r)
+        first = self._config_sig is None
+        self._config_sig = sig
+        self.settings = settings
+        self.sync_interval = float(settings["sync_interval"])
+        self.debounce = float(settings["debounce"])
+        self.retry_delay = float(settings["retry_delay"])
+        self.entry_timeout = settings["entry_timeout"]
+        self.families = [4, 6] if settings["ipv6"] else [4]
+        self.events_retention = int(settings["events_retention_days"])
+        self.f2b = Fail2ban(self.f2b_client, parse_list(settings["jails"]))
         self.routers = routers
-        if self._routers_loaded:
-            log.info("lista de roteadores atualizada: %s", self.describe_routers())
-        self._routers_loaded = True
+        self.whitelist = []
+        for entry in whitelist:
+            try:
+                self.whitelist.append(ipaddress.ip_network(entry, strict=False))
+            except ValueError:
+                pass
+        self.blacklist_entries = [e for e, _exp in blacklist]
+        self._ignored_logged.clear()
+        if not first:
+            log.info("configuracao atualizada pelo painel; roteadores: %s", self.describe_routers() or "nenhum")
         return True
+
+    def audit(self, action, target="", details=None):
+        self.store.audit("agente", action, target, details)
 
     # -- historico de eventos -------------------------------------------------------
     def open_events(self, import_history=False):
@@ -607,24 +649,12 @@ class Agent:
         return False
 
     def _blacklist(self):
-        """Le a blacklist: {chave: (ip_ou_rede, {"blacklist"})}. Arquivo ausente = vazia."""
+        """Blacklist ativa (do banco): {chave: (ip_ou_rede, {"blacklist"})}."""
         result = {}
-        if not self.blacklist_file:
-            return result
-        try:
-            with open(self.blacklist_file, encoding="utf-8") as fh:
-                lines = fh.readlines()
-        except FileNotFoundError:
-            return result
-        except OSError as e:
-            raise BlacklistError("nao foi possivel ler a blacklist %s: %s" % (self.blacklist_file, e))
-        for n, line in enumerate(lines, 1):
-            text, _comment = parse_blacklist_line(line)
-            if not text:
-                continue
+        for text in self.blacklist_entries:
             entry = normalize_ip(text)
             if entry is None:
-                self._log_ignored(text, "linha %d da blacklist invalida" % n)
+                self._log_ignored(text, "entrada invalida na blacklist")
             elif self._whitelisted(entry):
                 self._log_ignored(str(entry), "esta na blacklist, mas tambem na whitelist")
             elif entry.version not in self.families:
@@ -714,8 +744,11 @@ class Agent:
         desired, f2b_ok = self._desired()
         if f2b_ok:
             self._clear_error("fontes", "fail2ban respondendo novamente")
-        self.reload_routers()
         ok = f2b_ok
+        if not any(r["enabled"] for r in self.routers):
+            self._report_error("roteadores", "nenhum roteador ativo cadastrado: cadastre os MikroTiks no painel")
+            return False
+        self._clear_error("roteadores", "roteador(es) cadastrado(s): %s" % self.describe_routers())
         for router in self.routers:
             if not router["enabled"]:
                 continue
@@ -752,9 +785,11 @@ class Agent:
                     api.talk(words)
                     added += 1
                     log.info("BLOQUEADO no MikroTik [%s]: %s (jail: %s)", name, key, jail_txt)
+                    self.audit("agente.bloqueio", key, {"roteador": name, "origem": jail_txt})
                 except RouterOSTrap as e:
                     errors += 1
                     log.error("erro ao bloquear %s no MikroTik [%s]: %s", key, name, e)
+                    self.audit("agente.erro", key, {"roteador": name, "operacao": "bloquear", "erro": str(e)})
 
             for key in to_remove:
                 fam, rid, comment = managed[key]
@@ -765,9 +800,11 @@ class Agent:
                     api.talk([LIST_PATHS[fam] + "/remove", "=.id=" + rid])
                     removed += 1
                     log.info("LIBERADO no MikroTik [%s]: %s (%s)", name, key, comment)
+                    self.audit("agente.liberacao", key, {"roteador": name, "entrada": comment})
                 except RouterOSTrap as e:
                     errors += 1
                     log.error("erro ao liberar %s no MikroTik [%s]: %s", key, name, e)
+                    self.audit("agente.erro", key, {"roteador": name, "operacao": "liberar", "erro": str(e)})
 
         level = logging.INFO if (to_add or to_remove or errors) else logging.DEBUG
         log.log(level, "sincronizacao %s [%s]: %d a bloquear (fail2ban + blacklist), %d no roteador | "
@@ -796,18 +833,13 @@ class Agent:
     def test(self):
         ok = True
         desired = None
-        print("blacklist ...", end=" ", flush=True)
-        try:
-            blacklist = self._blacklist()
-            if not self.blacklist_file:
-                print("desativada")
-            elif not os.path.exists(self.blacklist_file):
-                print("OK - %s nao existe (vazia)" % self.blacklist_file)
-            else:
-                print("OK - %d entrada(s) em %s" % (len(blacklist), self.blacklist_file))
-        except BlacklistError as e:
-            print("FALHOU: %s" % e)
-            blacklist, ok = {}, False
+        print("configuracao ... OK - %s: %d roteador(es), %d na blacklist, %d na whitelist, %d usuario(s)" % (
+            self.store.path, len(self.routers), len(self.blacklist_entries), len(self.whitelist),
+            len(self.store.users())))
+        blacklist = self._blacklist()
+        if not self.routers:
+            print("  nenhum roteador cadastrado: cadastre os MikroTiks no painel (aba Roteadores)")
+            ok = False
         print("fail2ban ...", end=" ", flush=True)
         try:
             banned = self._from_fail2ban()
@@ -857,6 +889,7 @@ class Agent:
         if msg != last_msg or now - last_time >= 300:
             log.error("%s (nova tentativa em %ds)", msg, self.retry_delay)
             self._errors[key] = (msg, now)
+            self.audit("agente.erro", key, {"erro": msg})
 
     def _clear_error(self, key, msg):
         if self._errors.pop(key, None) is not None:
@@ -873,10 +906,11 @@ class Agent:
         # o log passa a ser acompanhado antes da importacao do historico: nada escrito durante ela se perde
         watcher = LogWatcher(self.f2b_log) if self.f2b_log else None
         self.open_events(import_history=True)
-        bl_sig = file_signature(self.blacklist_file) if self.blacklist_file else None
+        self.audit("agente.iniciado", __version__, {"roteadores": self.describe_routers()})
         bl_snapshot = self._blacklist_snapshot()
         f2b_snapshot = None  # so usado sem log do fail2ban: eventos deduzidos entre sincronizacoes
         next_sync = 0.0
+        next_housekeeping = next_purge = 0.0
         pending_since = last_event = None
         labels = {"ban": "Ban", "unban": "Unban", "restore": "Restore Ban"}
 
@@ -891,18 +925,28 @@ class Agent:
                     rows.append((ts, kind, str(key) if key is not None else ip, jail, "fail2ban"))
                     changed = True
                 self.record(rows)
-            if self.blacklist_file:
-                sig = file_signature(self.blacklist_file)
-                if sig != bl_sig:
-                    log.info("blacklist %s alterada", self.blacklist_file)
-                    bl_sig, changed = sig, True
+            if now >= next_housekeeping:  # validade da blacklist e retencao da auditoria
+                next_housekeeping = now + 30
+                try:
+                    for row in self.store.expire_blacklist():
+                        log.info("blacklist: %s expirou", row["entry"])
+                    if now >= next_purge:
+                        next_purge = now + 3600
+                        self.store.audit_purge(int(self.settings["audit_retention_days"]))
+                        if self.events is not None and self.events_retention > 0:
+                            self.events.purge(self.events_retention)
+                except sqlite3.Error as e:
+                    self._report_error("banco", "falha ao acessar %s: %s" % (self.store.path, e))
+                self._data_version = None  # forca reler (as remocoes acima sao deste mesmo processo)
+            try:
+                if self.reload():
+                    changed = True
                     snapshot = self._blacklist_snapshot()
-                    if snapshot is not None and bl_snapshot is not None:
-                        self._record_diff(bl_snapshot, snapshot, "bl-add", "bl-del", BLACKLIST_TAG)
-                    if snapshot is not None:
-                        bl_snapshot = snapshot
-            if self.reload_routers():
-                changed = True
+                    self._record_diff(bl_snapshot, snapshot, "bl-add", "bl-del", BLACKLIST_TAG)
+                    bl_snapshot = snapshot
+                    self._clear_error("banco", "banco de configuracao acessivel novamente")
+            except sqlite3.Error as e:
+                self._report_error("banco", "falha ao ler a configuracao em %s: %s" % (self.store.path, e))
             if changed:
                 last_event = now
                 if pending_since is None:
@@ -921,15 +965,11 @@ class Agent:
                     f2b_snapshot = self._last_f2b
 
             time.sleep(0.5)
+        self.audit("agente.encerrado", __version__)
         log.info("agente finalizado")
 
     def _blacklist_snapshot(self):
-        if not self.blacklist_file:
-            return {}
-        try:
-            return {k: set() for k in self._blacklist()}
-        except BlacklistError:
-            return None
+        return {k: set() for k in self._blacklist()}
 
 
 # --------------------------------------------------------------------------- #
@@ -939,12 +979,12 @@ DEFAULTS = {
     "mikrotik": {"name": PRIMARY_ID, "port": "8728", "use_ssl": "no", "timeout": "10", "address_list": "fail2ban",
                  "comment_prefix": "f2b-agent", "entry_timeout": "", "ipv6": "no"},
     "fail2ban": {"client": "/usr/bin/fail2ban-client", "logfile": "/var/log/fail2ban.log", "jails": "",
-                 "whitelist": "127.0.0.0/8, ::1"},
+                 "whitelist": "127.0.0.0/8, ::1, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10"},
     "blacklist": {"file": "/etc/f2b-mikrotik/blacklist.txt"},
     "agent": {"sync_interval": "60", "debounce": "2", "retry_delay": "15",
               "logfile": "/var/log/f2b-mikrotik.log", "log_level": "INFO",
               "log_max_bytes": "10485760", "log_backups": "5", "lockfile": "/run/f2b-mikrotik.lock",
-              "routers_file": "/etc/f2b-mikrotik/routers.json",
+              "routers_file": "/etc/f2b-mikrotik/routers.json", "config_db": "/var/lib/f2b-mikrotik/config.db",
               "events_db": "/var/lib/f2b-mikrotik/events.db", "events_retention_days": "365"},
     "web": {"bind": "0.0.0.0", "port": "8088", "username": "admin", "password": "",
             "tls_cert": "", "tls_key": "", "geoip": "yes", "geo_file": "/var/lib/f2b-mikrotik/geo.tsv.gz",
@@ -957,10 +997,27 @@ def load_config(path):
     cfg.read_dict(DEFAULTS)
     if not cfg.read(path, encoding="utf-8"):
         raise SystemExit("arquivo de configuracao nao encontrado: %s" % path)
-    for key in ("host", "username", "password"):
-        if not cfg["mikrotik"].get(key, "").strip():
-            raise SystemExit("configuracao: [mikrotik] %s e obrigatorio" % key)
+    if not cfg["agent"].get("config_db", "").strip():
+        raise SystemExit("configuracao: [agent] config_db e obrigatorio")
     return cfg
+
+
+def reset_password(agent, username):
+    """Recuperacao de acesso pelo terminal: redefine a senha (ou cria o usuario como admin)."""
+    import getpass
+    password = os.environ.get("F2B_NEW_PASSWORD", "")
+    generated = False
+    if not password and sys.stdin.isatty():
+        password = getpass.getpass("nova senha para %s: " % username)
+        if password != getpass.getpass("repita a senha: "):
+            raise SystemExit("as senhas nao conferem")
+    if not password:
+        password, generated = f2b_store.secrets.token_urlsafe(12), True
+    try:
+        agent.store.reset_password(username, password)
+    except f2b_store.StoreError as e:
+        raise SystemExit(str(e))
+    print("senha de %s redefinida%s" % (username, (": " + password) if generated else ""))
 
 
 def setup_logging(cfg, verbose):
@@ -1002,18 +1059,23 @@ def main():
     mode.add_argument("--once", action="store_true", help="faz uma sincronizacao e sai (modo cron)")
     mode.add_argument("--test", action="store_true", help="testa fail2ban e roteador sem alterar nada")
     mode.add_argument("--flush", action="store_true", help="remove do roteador todas as entradas do agente")
+    mode.add_argument("--reset-password", metavar="USUARIO",
+                      help="redefine a senha de um usuario do painel (cria como admin se nao existir); "
+                           "a senha vem de F2B_NEW_PASSWORD, do teclado ou e gerada")
     ap.add_argument("--dry-run", action="store_true", help="mostra o que faria, sem alterar o roteador")
     ap.add_argument("-v", "--verbose", action="store_true", help="log em DEBUG e tambem no terminal")
     ap.add_argument("--version", action="version", version=__version__)
     args = ap.parse_args()
 
     cfg = load_config(args.config)
+    setup_logging(cfg, args.verbose)  # antes do Agent: a migracao da configuracao registra no log
     agent = Agent(cfg, dry_run=args.dry_run or args.test)
 
     if args.test:
         sys.exit(0 if agent.test() else 1)
+    if args.reset_password:
+        return reset_password(agent, args.reset_password)
 
-    setup_logging(cfg, args.verbose)
     lock = acquire_lock(cfg["agent"].get("lockfile"))  # noqa: F841 (mantem a trava ate o fim)
 
     if args.flush:

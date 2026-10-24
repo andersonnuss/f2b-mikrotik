@@ -18,6 +18,12 @@
       <span class="muted small" id="updated"></span>
       <label class="check-inline"><input type="checkbox" id="auto"> atualizar a cada 30 s</label>
       <button id="refresh" class="btn">Atualizar</button>
+      <div class="user-menu">
+        <span id="user-name" class="small"></span>
+        <span id="user-role" class="pill"></span>
+        <button id="change-pass" class="btn small" type="button">Trocar senha</button>
+        <button id="logout" class="btn small" type="button">Sair</button>
+      </div>
     </div>
   </header>
 
@@ -36,7 +42,10 @@
     <nav class="tabs" role="tablist">
       <button type="button" role="tab" data-tab="overview" class="active">Visão geral</button>
       <button type="button" role="tab" data-tab="stats">Estatísticas</button>
-      <button type="button" role="tab" data-tab="routers">Roteadores <span class="count" id="count-routers"></span></button>
+      <button type="button" role="tab" data-tab="routers" data-role="admin">Roteadores <span class="count" id="count-routers"></span></button>
+      <button type="button" role="tab" data-tab="settings" data-role="admin">Configurações</button>
+      <button type="button" role="tab" data-tab="users" data-role="admin">Usuários</button>
+      <button type="button" role="tab" data-tab="audit" data-role="admin">Auditoria</button>
       <button type="button" role="tab" data-tab="log">Log do agente</button>
     </nav>
 
@@ -76,9 +85,18 @@
       <div class="grid-2 mt">
         <div class="card">
           <h2>Blacklist <span class="muted small">(bloqueio manual)</span></h2>
-          <form id="bl-form" class="bl-form" autocomplete="off">
+          <form id="bl-form" class="bl-form" autocomplete="off" data-role="operador">
             <input name="entry" class="mono" placeholder="IP ou rede (ex.: 203.0.113.45)" spellcheck="false" required>
             <input name="comment" placeholder="motivo (opcional)" maxlength="100">
+            <select name="expires" title="por quanto tempo bloquear">
+              <option value="0">permanente</option>
+              <option value="3600">1 hora</option>
+              <option value="21600">6 horas</option>
+              <option value="86400">1 dia</option>
+              <option value="604800">7 dias</option>
+              <option value="2592000">30 dias</option>
+              <option value="7776000">90 dias</option>
+            </select>
             <button class="btn primary" type="submit">Incluir</button>
           </form>
           <div id="bl-box"></div>
@@ -133,6 +151,90 @@
       <div class="table-wrap"><table class="table" id="routers-table"></table></div>
     </section>
 
+    <section id="tab-settings" class="tab">
+      <div id="settings-error"></div>
+      <div class="grid-2">
+        <form id="settings-form" class="card" autocomplete="off">
+          <h2>Operação</h2>
+          <div class="form-grid">
+            <label>Reconciliação completa a cada (s)<input name="sync_interval" type="number" min="10" max="3600"></label>
+            <label>Espera após um evento (s)<input name="debounce" type="number" min="0" max="60" step="0.5"></label>
+            <label>Nova tentativa após falha (s)<input name="retry_delay" type="number" min="5" max="3600"></label>
+            <label>Validade da entrada no roteador<input name="entry_timeout" placeholder="vazio = permanente (ex.: 7d)" class="mono"></label>
+            <label class="span-2">Jails replicadas<input name="jails" placeholder="vazio = todas (ex.: sshd, nginx-http-auth)"></label>
+            <label class="check-inline span-2"><input type="checkbox" name="ipv6"> replicar também IPv6</label>
+          </div>
+          <h2 class="mt">Histórico e auditoria</h2>
+          <div class="form-grid">
+            <label>Dias de histórico de eventos<input name="events_retention_days" type="number" min="0" max="3650"></label>
+            <label>Dias de auditoria<input name="audit_retention_days" type="number" min="0" max="3650"></label>
+          </div>
+          <h2 class="mt">País de origem</h2>
+          <div class="form-grid">
+            <label class="check-inline span-2"><input type="checkbox" name="geoip"> tabelas dos RIRs (offline, sem enviar IPs)</label>
+            <label>Fonte do país<select name="geo_provider"><option value="rir">RIRs</option><option value="ipinfo">ipinfo Lite (API)</option></select></label>
+            <label>Dias de cache do ipinfo<input name="geo_cache_days" type="number" min="1" max="365"></label>
+            <label class="span-2">Token do ipinfo<input name="ipinfo_token" type="password" autocomplete="off" placeholder="em branco = manter o atual"></label>
+          </div>
+          <div class="dialog-actions">
+            <span class="muted small" id="settings-info"></span>
+            <span class="spacer"></span>
+            <button class="btn primary" type="submit">Salvar configurações</button>
+          </div>
+        </form>
+        <div>
+          <div class="card">
+            <h2>Whitelist <span class="muted small">(o agente nunca bloqueia estes IPs/redes)</span></h2>
+            <form id="wl-form" class="bl-form" autocomplete="off">
+              <input name="entry" class="mono" placeholder="IP ou rede (ex.: 200.200.200.10)" spellcheck="false" required>
+              <input name="comment" placeholder="descrição (ex.: escritório)" maxlength="100">
+              <button class="btn primary" type="submit">Incluir</button>
+            </form>
+            <div id="wl-admin"></div>
+          </div>
+          <div class="card mt">
+            <h2>Somente no servidor <span class="muted small">(config.ini, por segurança)</span></h2>
+            <dl class="kv" id="settings-readonly"></dl>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="tab-users" class="tab">
+      <div class="toolbar">
+        <button class="btn primary" id="user-add" type="button">+ Cadastrar usuário</button>
+        <span class="muted small"><strong>leitura</strong>: só consulta · <strong>operador</strong>: também desbane e mexe na blacklist · <strong>administrador</strong>: tudo, inclusive whitelist, roteadores, configurações, usuários e auditoria</span>
+      </div>
+      <div class="table-wrap"><table class="table" id="users-table"></table></div>
+    </section>
+
+    <section id="tab-audit" class="tab">
+      <form id="audit-form" class="toolbar" autocomplete="off">
+        <select name="actor"><option value="">todos os usuários</option></select>
+        <select name="action">
+          <option value="">todas as ações</option>
+          <option value="login">login / logout</option>
+          <option value="usuario">usuários</option>
+          <option value="senha">senhas</option>
+          <option value="config">configurações</option>
+          <option value="roteador">roteadores</option>
+          <option value="blacklist">blacklist</option>
+          <option value="whitelist">whitelist</option>
+          <option value="fail2ban">desbanimentos</option>
+          <option value="agente">agente (bloqueios nos roteadores)</option>
+          <option value="acesso">acessos negados</option>
+          <option value="sistema">sistema</option>
+        </select>
+        <input name="text" placeholder="IP, alvo ou detalhe" spellcheck="false">
+        <label class="check-inline small">de <input name="since" type="date"></label>
+        <label class="check-inline small">até <input name="until" type="date"></label>
+        <button class="btn" type="submit">Filtrar</button>
+        <button class="btn" type="button" id="audit-csv">Exportar CSV</button>
+      </form>
+      <div class="table-wrap"><table class="table" id="audit-table"></table></div>
+      <div class="mt"><button class="btn" type="button" id="audit-more" hidden>Carregar mais</button></div>
+    </section>
+
     <section id="tab-log" class="tab">
       <div class="toolbar">
         <input id="log-filter" placeholder="filtrar (ex.: BLOQUEADO, 203.0.113.5, ERROR)" spellcheck="false">
@@ -181,6 +283,46 @@
         <span class="spacer"></span>
         <button type="button" class="btn" id="delete-cancel">Cancelar</button>
         <button type="button" class="btn danger" id="delete-confirm">Excluir</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="user-dialog">
+    <form id="user-form" method="dialog" autocomplete="off">
+      <h2 id="user-dialog-title">Cadastrar usuário</h2>
+      <div class="form-grid">
+        <label>Usuário<input name="username" required pattern="[A-Za-z0-9._@\-]{2,40}" class="mono"></label>
+        <label>Nome<input name="name" maxlength="80"></label>
+        <label>Papel<select name="role">
+          <option value="leitura">somente leitura</option>
+          <option value="operador">operador</option>
+          <option value="admin">administrador</option>
+        </select></label>
+        <label>Senha<input name="password" type="password" autocomplete="new-password" minlength="8"></label>
+        <label class="check-inline span-2"><input type="checkbox" name="enabled" checked> ativo</label>
+      </div>
+      <div id="user-error"></div>
+      <div class="dialog-actions">
+        <span class="spacer"></span>
+        <button type="button" class="btn" id="user-cancel">Cancelar</button>
+        <button type="submit" class="btn primary">Salvar</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="password-dialog">
+    <form id="password-form" method="dialog" autocomplete="off">
+      <h2>Trocar minha senha</h2>
+      <div class="form-grid">
+        <label class="span-2">Senha atual<input name="current" type="password" autocomplete="current-password" required></label>
+        <label>Nova senha<input name="new" type="password" autocomplete="new-password" minlength="8" required></label>
+        <label>Repita a nova senha<input name="again" type="password" autocomplete="new-password" minlength="8" required></label>
+      </div>
+      <div id="password-error"></div>
+      <div class="dialog-actions">
+        <span class="spacer"></span>
+        <button type="button" class="btn" id="password-cancel">Cancelar</button>
+        <button type="submit" class="btn primary">Trocar senha</button>
       </div>
     </form>
   </dialog>

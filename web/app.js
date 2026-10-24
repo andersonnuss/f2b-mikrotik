@@ -21,9 +21,18 @@ async function api(path, opts = {}) {
   }
   // location.origin nao inclui usuario:senha (fetch recusa URLs com credenciais embutidas)
   const res = await fetch(new URL(path, location.origin), init);
+  if (res.status === 401) {  // sessao expirada ou encerrada
+    location.replace("/login");
+    throw new Error("sessão expirada");
+  }
   let data = null;
   try { data = await res.json(); } catch (_) { /* resposta sem JSON */ }
-  if (!res.ok) throw new Error((data && data.error) || `${res.status} ${res.statusText}`);
+  if (!res.ok) {
+    const err = new Error((data && data.error) || `${res.status} ${res.statusText}`);
+    err.data = data;
+    err.status = res.status;
+    throw err;
+  }
   return data;
 }
 
@@ -49,6 +58,17 @@ const relText = (m) => (m.relation === "igual" ? esc(m.entry) : `${REL_TEXT[m.re
 
 let overview = null;
 let routersCache = [];
+
+// usuario logado e papeis: a tela esconde o que o papel nao permite (o servidor tambem bloqueia)
+let me = null;
+const RANK = { leitura: 0, operador: 1, admin: 2 };
+const can = (role) => !!me && RANK[me.role] >= RANK[role];
+function applyRole() {
+  $$("[data-role]").forEach((el) => { el.hidden = !can(el.dataset.role); });
+  $("#user-name").textContent = me.name ? `${me.name} (${me.username})` : me.username;
+  $("#user-role").textContent = me.role_label;
+  $("#user-role").className = `pill ${me.role === "admin" ? "info" : ""}`;
+}
 
 // pais: codigo ISO -> bandeira + nome em portugues; sem codigo -> "desconhecido"
 let regionNames = null;
@@ -83,6 +103,9 @@ function showTab(name) {
   $$(".tab").forEach((t) => t.classList.toggle("active", t.id === `tab-${name}`));
   if (name === "log") loadLog();
   if (name === "stats") loadStats();
+  if (name === "settings") loadSettings();
+  if (name === "users") loadUsers();
+  if (name === "audit") loadAudit();
   try { localStorage.setItem("f2b-tab", name); } catch (_) { /* sem storage */ }
 }
 $$(".tabs button").forEach((b) => b.addEventListener("click", () => showTab(b.dataset.tab)));
@@ -99,7 +122,7 @@ async function loadOverview() {
     $("#overview-error").innerHTML = "";
     renderOverview();
     renderEntries();
-    renderRouters();
+    if (can("admin")) renderRouters();
   } catch (e) {
     $("#overview-error").innerHTML = `<div class="alert">Falha ao carregar: ${esc(e.message)}</div>`;
   } finally {
@@ -144,7 +167,7 @@ function renderOverview() {
          </dl>`
       : (r.error ? `<div class="alert">${esc(r.error)}</div>` : "");
     return `<div class="router-card ${r.status === "offline" ? "offline" : ""}">
-      <header><strong>${esc(r.name)}</strong>${r.primary ? '<span class="pill">principal</span>' : ""}${statusPill(r.status)}</header>
+      <header><strong>${esc(r.name)}</strong>${statusPill(r.status)}</header>
       <div class="muted mono small">${esc(r.host)}:${esc(r.port)}${r.use_ssl ? " · SSL" : ""}</div>
       ${info}
     </div>`;
@@ -160,17 +183,16 @@ function renderOverview() {
       : '<span class="muted">nenhuma jail ativa</span>');
 
   const b = o.blacklist;
-  $("#bl-form").hidden = !b.file;
-  $("#bl-box").innerHTML = !b.file ? '<span class="muted">desativada no config.ini ([blacklist] file)</span>'
-    : !b.ok ? `<div class="alert">${esc(b.error)}</div>`
-      : (b.items.length ? `<div class="bl-list">${b.items.map((it) => `
-          <div class="bl-item">
-            <button type="button" class="link mono" data-check="${esc(it.entry)}">${esc(it.entry)}</button>
-            <span class="muted small bl-comment">${esc(it.comment)}</span>
-            ${it.ignored ? `<span class="pill warn" title="o agente ignora esta linha">ignorado: ${esc(it.ignored)}</span>` : ""}
-            <button type="button" class="btn small" data-act="bl-del" data-entry="${esc(it.entry)}" title="remover da blacklist">Remover</button>
-          </div>`).join("")}</div>` : '<p class="muted small">vazia</p>')
-        + `<div class="muted small mono mt">${esc(b.file)}</div>`;
+  $("#bl-box").innerHTML = !b.ok ? `<div class="alert">${esc(b.error)}</div>`
+    : (b.items.length ? `<div class="bl-list">${b.items.map((it) => `
+        <div class="bl-item">
+          <button type="button" class="link mono" data-check="${esc(it.entry)}">${esc(it.entry)}</button>
+          <span class="muted small bl-comment" title="${esc(it.comment)}">${esc(it.comment)}
+            <span class="nowrap">· ${esc(it.created_by || "?")} em ${fmtTs(it.created_at)}</span>
+            ${it.expires_at ? `<span class="nowrap">· <strong>expira ${fmtTs(it.expires_at)}</strong></span>` : ""}</span>
+          ${it.ignored ? `<span class="pill warn" title="o agente ignora esta entrada">ignorado: ${esc(it.ignored)}</span>` : ""}
+          ${can("operador") ? `<button type="button" class="btn small" data-act="bl-del" data-entry="${esc(it.entry)}">Remover</button>` : ""}
+        </div>`).join("")}</div>` : '<p class="muted small">vazia</p>');
   $("#wl-box").innerHTML = o.whitelist.length
     ? `<div class="chips">${o.whitelist.map(chip).join("")}</div>` : '<span class="muted">vazia</span>';
 }
@@ -230,6 +252,7 @@ function renderEntries() {
 }
 
 function rowActions(e) {
+  if (!can("operador")) return "";
   const out = [];
   if (e.jails.length) out.push(`<button type="button" class="btn small" data-act="unban" data-ip="${esc(e.key)}">Desbanir</button>`);
   if (e.blacklist) out.push(`<button type="button" class="btn small" data-act="bl-del" data-entry="${esc(e.key)}">Tirar da blacklist</button>`);
@@ -271,13 +294,13 @@ async function doUnban(ip) {
   refreshSoon();
 }
 
-async function doBlacklistAdd(entry, comment) {
+async function doBlacklistAdd(entry, comment, expires = 0) {
   if (comment === undefined) {
-    comment = prompt(`Incluir ${entry} na blacklist?\nEle será bloqueado em todos os MikroTiks.\n\nMotivo (opcional):`, "");
+    comment = prompt(`Incluir ${entry} na blacklist (permanente)?\nEle será bloqueado em todos os MikroTiks.\n\nMotivo (opcional):`, "");
     if (comment === null) return;
   }
-  const r = await api("/api/blacklist", { method: "POST", body: { entry, comment } });
-  toast(`${r.entry} incluído na blacklist. O agente está bloqueando nos MikroTiks…`);
+  const r = await api("/api/blacklist", { method: "POST", body: { entry, comment, expires } });
+  toast(`${r.entry} incluído na blacklist${expires ? " (com validade)" : ""}. O agente está bloqueando nos MikroTiks…`);
   refreshSoon();
   return r;
 }
@@ -311,7 +334,8 @@ $("#bl-form").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const fe = ev.target.elements;
   try {
-    await doBlacklistAdd(fe.namedItem("entry").value.trim(), fe.namedItem("comment").value.trim());
+    await doBlacklistAdd(fe.namedItem("entry").value.trim(), fe.namedItem("comment").value.trim(),
+      Number(fe.namedItem("expires").value));
     ev.target.reset();
   } catch (e) {
     toast(e.message, "bad");
@@ -375,7 +399,10 @@ function renderCheck(c) {
       `jail <strong>${esc(m.jail)}</strong> (${relText(m)})${m.replicated ? "" : ' <span class="pill warn">jail não replicada</span>'}`).join("; "));
   } else facts.push("Não está banido no fail2ban.");
   if (!c.blacklist.ok) facts.push(`blacklist: <span class="st st-bad">erro</span> ${esc(c.blacklist.error)}`);
-  else if (c.blacklist.matches.length) facts.push("Na <strong>blacklist</strong>: " + c.blacklist.matches.map(relText).join(", "));
+  else if (c.blacklist.matches.length) {
+    facts.push("Na <strong>blacklist</strong>: " + c.blacklist.matches.map((m) => relText(m)
+      + (m.expires_at ? ` <span class="muted small">(expira ${fmtTs(m.expires_at)})</span>` : "")).join(", "));
+  }
   else facts.push("Não está na blacklist.");
 
   const notBlockedButShould = online.filter((r) => !r.blocked && expected);
@@ -397,14 +424,16 @@ function renderCheck(c) {
   }).join("");
 
   const actions = [];
-  if (c.fail2ban.matches.some((m) => m.relation === "igual")) {
+  if (!can("operador")) { /* leitura: sem acoes */ } else if (c.fail2ban.matches.some((m) => m.relation === "igual")) {
     actions.push(`<button type="button" class="btn" data-act="unban" data-ip="${esc(c.query)}">Desbanir no fail2ban</button>`);
   }
   const blExact = c.blacklist.matches.filter((m) => m.relation === "igual");
-  c.blacklist.matches.forEach((m) => {
-    actions.push(`<button type="button" class="btn" data-act="bl-del" data-entry="${esc(m.entry)}">Tirar ${esc(m.entry)} da blacklist</button>`);
-  });
-  if (!blExact.length && !c.whitelist.length && c.blacklist.ok) {
+  if (can("operador")) {
+    c.blacklist.matches.forEach((m) => {
+      actions.push(`<button type="button" class="btn" data-act="bl-del" data-entry="${esc(m.entry)}">Tirar ${esc(m.entry)} da blacklist</button>`);
+    });
+  }
+  if (can("operador") && !blExact.length && !c.whitelist.length && c.blacklist.ok) {
     actions.push(`<button type="button" class="btn" data-act="bl-add" data-entry="${esc(c.query)}">Incluir na blacklist</button>`);
   }
 
@@ -427,21 +456,23 @@ function renderRouters() {
   api("/api/routers").then((d) => {
     routersCache = d.routers;
     $("#count-routers").textContent = d.routers.length;
-    $("#routers-table").innerHTML = `<thead><tr><th>nome</th><th>endereço</th><th>usuário</th><th>status</th><th class="center">recebe bloqueios</th><th></th></tr></thead><tbody>` +
-      d.routers.map((r) => {
+    $("#routers-table").innerHTML = `<thead><tr><th>nome</th><th>endereço</th><th>usuário</th><th>status</th><th class="center">recebe bloqueios</th><th>última alteração</th><th></th></tr></thead><tbody>` +
+      (d.routers.length ? d.routers.map((r) => {
         const st = status[r.id];
         return `<tr>
-          <td><strong>${esc(r.name)}</strong> ${r.primary ? '<span class="pill">principal · config.ini</span>' : ""}</td>
+          <td><strong>${esc(r.name)}</strong></td>
           <td class="mono">${esc(r.host)}:${esc(r.port)}${r.use_ssl ? " (SSL)" : ""}</td>
           <td class="mono">${esc(r.username)}</td>
           <td>${st ? statusPill(st.status) : ""}${st && st.error ? `<div class="muted small">${esc(st.error)}</div>` : ""}</td>
           <td class="center">${r.enabled ? '<span class="st st-ok">sim</span>' : '<span class="st st-warn">não</span>'}</td>
+          <td class="small muted nowrap">${esc(r.updated_by || "")} ${fmtTs(r.updated_at)}</td>
           <td><div class="actions">
             <button class="btn small" data-act="test" data-id="${esc(r.id)}">Testar</button>
-            ${r.primary ? "" : `<button class="btn small" data-act="edit" data-id="${esc(r.id)}">Editar</button>
-            <button class="btn small" data-act="delete" data-id="${esc(r.id)}">Excluir</button>`}
+            <button class="btn small" data-act="edit" data-id="${esc(r.id)}">Editar</button>
+            <button class="btn small" data-act="delete" data-id="${esc(r.id)}">Excluir</button>
           </div></td></tr>`;
-      }).join("") + "</tbody>";
+      }).join("") : '<tr><td colspan="7" class="empty">nenhum roteador cadastrado: o agente não tem para onde replicar os bloqueios</td></tr>')
+      + "</tbody>";
   }).catch((e) => {
     $("#routers-table").innerHTML = `<tbody><tr><td class="empty">${esc(e.message)}</td></tr></tbody>`;
   });
@@ -749,6 +780,282 @@ window.addEventListener("resize", () => {
 });
 
 // ---------------------------------------------------------------------------
+// configuracoes e whitelist (admin)
+// ---------------------------------------------------------------------------
+const sform = $("#settings-form");
+let settingsData = null;
+
+async function loadSettings() {
+  try {
+    settingsData = await api("/api/settings");
+    $("#settings-error").innerHTML = "";
+    renderSettings();
+  } catch (e) {
+    $("#settings-error").innerHTML = `<div class="alert">${esc(e.message)}</div>`;
+  }
+}
+
+function renderSettings() {
+  const v = settingsData.values;
+  Object.entries(v).forEach(([k, val]) => {
+    const el = sform.elements.namedItem(k);
+    if (!el) return;
+    if (el.type === "checkbox") el.checked = !!val;
+    else if (k === "ipinfo_token") { el.value = ""; el.placeholder = val ? "token configurado (em branco = manter)" : "sem token"; }
+    else el.value = val;
+  });
+  $("#settings-info").textContent = "";
+  const ro = settingsData.readonly;
+  $("#settings-readonly").innerHTML = [
+    ["address-list no MikroTik", ro.address_list], ["prefixo dos comentários", ro.comment_prefix],
+    ["log do fail2ban", ro.fail2ban_log], ["banco de configuração", ro.config_db], ["histórico de eventos", ro.events_db],
+  ].map(([k, val]) => `<dt>${esc(k)}</dt><dd class="mono small">${esc(val || "—")}</dd>`).join("");
+  $("#wl-admin").innerHTML = settingsData.whitelist.length ? `<div class="bl-list">${settingsData.whitelist.map((w) => `
+    <div class="bl-item">
+      <span class="mono">${esc(w.entry)}</span>
+      <span class="muted small bl-comment" title="${esc(w.comment)}">${esc(w.comment)}
+        <span class="nowrap">· ${esc(w.created_by || "?")} em ${fmtTs(w.created_at)}</span></span>
+      <button type="button" class="btn small" data-wl-del="${esc(w.entry)}">Remover</button>
+    </div>`).join("")}</div>` : '<p class="muted small">vazia: o agente pode bloquear qualquer IP</p>';
+}
+
+sform.addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const values = {};
+  Object.keys(settingsData.values).forEach((k) => {
+    const el = sform.elements.namedItem(k);
+    if (!el) return;
+    if (el.type === "checkbox") values[k] = el.checked;
+    else if (k === "ipinfo_token") { if (el.value) values[k] = el.value; }
+    else values[k] = el.value;
+  });
+  try {
+    const r = await api("/api/settings", { method: "PUT", body: { values } });
+    toast(r.changed.length ? `Configurações salvas: ${r.changed.join(", ")}. O agente aplica em ~2 s.` : "Nada mudou.");
+    loadSettings();
+  } catch (e) {
+    toast(e.message, "bad");
+  }
+});
+
+$("#wl-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const fe = ev.target.elements;
+  try {
+    const r = await api("/api/whitelist", { method: "POST",
+      body: { entry: fe.namedItem("entry").value.trim(), comment: fe.namedItem("comment").value.trim() } });
+    ev.target.reset();
+    toast(r.blacklist_ignored.length
+      ? `${r.entry} incluído na whitelist. Deixam de ser bloqueados: ${r.blacklist_ignored.join(", ")}.`
+      : `${r.entry} incluído na whitelist. O agente o libera nos MikroTiks se estiver bloqueado.`,
+    r.blacklist_ignored.length ? "warn" : "ok");
+    loadSettings();
+    refreshSoon();
+  } catch (e) {
+    toast(e.message, "bad");
+  }
+});
+
+$("#wl-admin").addEventListener("click", async (ev) => {
+  const btn = ev.target.closest("[data-wl-del]");
+  if (!btn) return;
+  const entry = btn.dataset.wlDel;
+  if (!confirm(`Remover ${entry} da whitelist?\n\nSe o fail2ban banir um IP dessa faixa, ele passa a ser bloqueado nos MikroTiks.`)) return;
+  try {
+    await api("/api/whitelist", { method: "DELETE", body: { entry } });
+  } catch (e) {
+    if (!(e.data && e.data.needs_confirm) || !confirm(`${e.message}`)) {
+      if (!(e.data && e.data.needs_confirm)) toast(e.message, "bad");
+      return;
+    }
+    try {
+      await api("/api/whitelist", { method: "DELETE", body: { entry, confirm: true } });
+    } catch (e2) {
+      toast(e2.message, "bad");
+      return;
+    }
+  }
+  toast(`${entry} removido da whitelist.`);
+  loadSettings();
+  refreshSoon();
+});
+
+// ---------------------------------------------------------------------------
+// usuarios (admin)
+// ---------------------------------------------------------------------------
+const udlg = $("#user-dialog");
+const uform = $("#user-form");
+const U = (n) => uform.elements.namedItem(n);
+let usersCache = [];
+let editingUser = null;
+
+async function loadUsers() {
+  try {
+    const d = await api("/api/users");
+    usersCache = d.users;
+    $("#users-table").innerHTML = `<thead><tr><th>usuário</th><th>nome</th><th>papel</th><th>situação</th><th>último acesso</th><th>criado</th><th></th></tr></thead><tbody>`
+      + d.users.map((u) => `<tr>
+        <td class="mono">${esc(u.username)}${u.username.toLowerCase() === me.username.toLowerCase() ? ' <span class="pill">você</span>' : ""}</td>
+        <td>${esc(u.name)}</td>
+        <td><span class="pill ${u.role === "admin" ? "info" : ""}">${esc(d.roles[u.role] || u.role)}</span></td>
+        <td>${u.enabled ? '<span class="st st-ok">ativo</span>' : '<span class="st st-warn">desativado</span>'}</td>
+        <td class="nowrap small">${fmtTs(u.last_login)}</td>
+        <td class="nowrap small muted">${esc(u.created_by || "")} ${fmtTs(u.created_at)}</td>
+        <td><div class="actions">
+          <button class="btn small" data-user-edit="${esc(u.username)}">Editar</button>
+          ${u.username.toLowerCase() === me.username.toLowerCase() ? "" : `<button class="btn small" data-user-del="${esc(u.username)}">Excluir</button>`}
+        </div></td></tr>`).join("") + "</tbody>";
+  } catch (e) {
+    $("#users-table").innerHTML = `<tbody><tr><td class="empty">${esc(e.message)}</td></tr></tbody>`;
+  }
+}
+
+function openUserDialog(u) {
+  editingUser = u || null;
+  uform.reset();
+  $("#user-error").innerHTML = "";
+  $("#user-dialog-title").textContent = u ? `Editar ${u.username}` : "Cadastrar usuário";
+  U("username").readOnly = !!u;
+  U("password").required = !u;
+  U("password").placeholder = u ? "em branco = manter a senha" : "mínimo 8 caracteres";
+  if (u) {
+    U("username").value = u.username;
+    U("name").value = u.name;
+    U("role").value = u.role;
+    U("enabled").checked = !!u.enabled;
+  }
+  udlg.showModal();
+}
+
+$("#user-add").addEventListener("click", () => openUserDialog(null));
+$("#user-cancel").addEventListener("click", () => udlg.close());
+$("#users-table").addEventListener("click", async (ev) => {
+  const ed = ev.target.closest("[data-user-edit]");
+  const del = ev.target.closest("[data-user-del]");
+  if (ed) openUserDialog(usersCache.find((u) => u.username === ed.dataset.userEdit));
+  if (del) {
+    const name = del.dataset.userDel;
+    if (!confirm(`Excluir o usuário ${name}?\n\nAs sessões abertas dele são encerradas. O histórico de auditoria é mantido.`)) return;
+    try {
+      await api(`/api/users/${encodeURIComponent(name)}`, { method: "DELETE" });
+      toast(`Usuário ${name} excluído.`);
+      loadUsers();
+    } catch (e) {
+      toast(e.message, "bad");
+    }
+  }
+});
+
+uform.addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const body = { name: U("name").value.trim(), role: U("role").value, enabled: U("enabled").checked };
+  if (U("password").value) body.password = U("password").value;
+  try {
+    if (editingUser) {
+      await api(`/api/users/${encodeURIComponent(editingUser.username)}`, { method: "PUT", body });
+    } else {
+      await api("/api/users", { method: "POST", body: Object.assign(body, { username: U("username").value.trim() }) });
+    }
+    udlg.close();
+    toast(editingUser ? `Usuário ${editingUser.username} atualizado.` : "Usuário cadastrado.");
+    loadUsers();
+  } catch (e) {
+    $("#user-error").innerHTML = `<div class="alert">${esc(e.message)}</div>`;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// auditoria (admin)
+// ---------------------------------------------------------------------------
+const aform = $("#audit-form");
+let auditRows = [];
+
+function auditQuery() {
+  const fe = aform.elements;
+  const params = new URLSearchParams();
+  ["actor", "action", "text"].forEach((k) => { if (fe.namedItem(k).value.trim()) params.set(k, fe.namedItem(k).value.trim()); });
+  const day = (v, plus) => (v ? String(Math.floor(new Date(`${v}T00:00:00`).getTime() / 1000) + plus) : "");
+  if (fe.namedItem("since").value) params.set("since", day(fe.namedItem("since").value, 0));
+  if (fe.namedItem("until").value) params.set("until", day(fe.namedItem("until").value, 86400));
+  return params;
+}
+
+async function loadAudit(more = false) {
+  const params = auditQuery();
+  if (more && auditRows.length) params.set("before", auditRows[auditRows.length - 1].id);
+  try {
+    const d = await api(`/api/audit?${params}`);
+    auditRows = more ? auditRows.concat(d.rows) : d.rows;
+    const sel = aform.elements.namedItem("actor");
+    const current = sel.value;
+    sel.innerHTML = '<option value="">todos os usuários</option>'
+      + d.actors.map((a) => `<option value="${esc(a)}">${esc(a)}</option>`).join("");
+    sel.value = current;
+    renderAudit();
+    $("#audit-more").hidden = !d.more;
+  } catch (e) {
+    $("#audit-table").innerHTML = `<tbody><tr><td class="empty">${esc(e.message)}</td></tr></tbody>`;
+  }
+}
+
+function auditDetails(d) {
+  if (!d) return "";
+  if (typeof d !== "object") return esc(d);
+  return Object.entries(d).map(([k, v]) => {
+    const val = Array.isArray(v) && v.length === 2 ? `${JSON.stringify(v[0])} → ${JSON.stringify(v[1])}`
+      : (typeof v === "object" ? JSON.stringify(v) : String(v));
+    return `<span class="nowrap"><span class="muted">${esc(k)}:</span> ${esc(val)}</span>`;
+  }).join(" · ");
+}
+
+function renderAudit() {
+  $("#audit-table").innerHTML = "<thead><tr><th>quando</th><th>usuário</th><th>IP</th><th>ação</th><th>alvo</th><th>detalhes</th></tr></thead><tbody>"
+    + (auditRows.length ? auditRows.map((r) => `<tr>
+      <td class="nowrap small">${fmtTs(r.ts)}:${pad(new Date(r.ts * 1000).getSeconds())}</td>
+      <td class="mono small">${esc(r.actor)}</td>
+      <td class="mono small">${esc(r.ip)}</td>
+      <td><span class="st ${/falha|negado|bloqueado|erro/.test(r.action) ? "st-bad" : "st-muted"}">${esc(r.action)}</span></td>
+      <td class="mono small">${esc(r.target)}</td>
+      <td class="small">${auditDetails(r.details)}</td></tr>`).join("")
+      : '<tr><td colspan="6" class="empty">nenhum registro com esses filtros</td></tr>')
+    + "</tbody>";
+}
+
+aform.addEventListener("submit", (ev) => { ev.preventDefault(); loadAudit(); });
+$("#audit-more").addEventListener("click", () => loadAudit(true));
+$("#audit-csv").addEventListener("click", () => {
+  window.location.href = new URL(`/api/audit.csv?${auditQuery()}`, location.origin).href;
+});
+
+// ---------------------------------------------------------------------------
+// minha senha e sair
+// ---------------------------------------------------------------------------
+const pdlg = $("#password-dialog");
+const pform = $("#password-form");
+$("#change-pass").addEventListener("click", () => { pform.reset(); $("#password-error").innerHTML = ""; pdlg.showModal(); });
+$("#password-cancel").addEventListener("click", () => pdlg.close());
+pform.addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const fe = pform.elements;
+  if (fe.namedItem("new").value !== fe.namedItem("again").value) {
+    $("#password-error").innerHTML = '<div class="alert">as senhas novas não conferem</div>';
+    return;
+  }
+  try {
+    await api("/api/me/password", { method: "POST",
+      body: { current: fe.namedItem("current").value, new: fe.namedItem("new").value } });
+    pdlg.close();
+    toast("Senha alterada. Suas outras sessões abertas foram encerradas.");
+  } catch (e) {
+    $("#password-error").innerHTML = `<div class="alert">${esc(e.message)}</div>`;
+  }
+});
+$("#logout").addEventListener("click", async () => {
+  try { await api("/api/logout", { method: "POST" }); } catch (_) { /* ja saiu */ }
+  location.replace("/login");
+});
+
+// ---------------------------------------------------------------------------
 // log do agente
 // ---------------------------------------------------------------------------
 let logLines = [];
@@ -796,15 +1103,23 @@ function setAuto(on) {
 $("#auto").addEventListener("change", (ev) => setAuto(ev.target.checked));
 $("#refresh").addEventListener("click", loadOverview);
 
-(function init() {
+(async function init() {
+  try {
+    me = await api("/api/me");
+  } catch (_) {
+    return;  // sem sessao: api() ja levou para /login
+  }
+  applyRole();
   let tab = "overview";
   let auto = false;
   try {
     tab = localStorage.getItem("f2b-tab") || tab;
     auto = localStorage.getItem("f2b-auto") === "1";
   } catch (_) { /* sem storage */ }
+  const btn = $(`.tabs [data-tab="${tab}"]`);
+  if (!btn || btn.hidden) tab = "overview";
   $("#auto").checked = auto;
   setAuto(auto);
-  if ($(`#tab-${tab}`)) showTab(tab);
+  showTab(tab);
   loadOverview();
 })();

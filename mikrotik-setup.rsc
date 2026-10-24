@@ -2,7 +2,7 @@
 #  Preparacao do MikroTik (RB750) para o agente f2b-mikrotik
 #  Antes de colar no terminal (Winbox > New Terminal), troque:
 #    192.168.88.10       -> IP do servidor Linux onde roda o agente
-#    TROQUE-ESTA-SENHA   -> mesma senha do config.ini
+#    TROQUE-ESTA-SENHA   -> a mesma senha que voce vai cadastrar no painel (aba Roteadores)
 #    WAN                 -> interface list da WAN (padrao da config de fabrica).
 #                           Se nao existir, use in-interface=ether1
 # =====================================================================
@@ -15,7 +15,7 @@
 
 # 3) Libera a API somente para o servidor (nunca exponha a API para a internet)
 /ip service set api disabled=no address=192.168.88.10/32
-#    Opcional, API criptografada (porta 8729, use_ssl = yes no config.ini):
+#    Opcional, API criptografada (porta 8729, marque "usar api-ssl" no cadastro do roteador no painel):
 # /certificate add name=api-cert common-name=api-cert days-valid=3650
 # /certificate sign api-cert
 # /ip service set api-ssl disabled=no address=192.168.88.10/32 certificate=api-cert
@@ -25,7 +25,7 @@
 #    Se ja houver regras em /ip firewall raw, mova esta para o topo.
 /ip firewall raw add chain=prerouting in-interface-list=WAN src-address-list=fail2ban action=drop comment="f2b-mikrotik: descarta IPs banidos pelo fail2ban"
 
-# 5) (Opcional) IPv6 - somente se ipv6 = yes no config.ini
+# 5) (Opcional) IPv6 - somente se "replicar tambem IPv6" estiver marcado no painel
 # /ipv6 firewall raw add chain=prerouting in-interface-list=WAN src-address-list=fail2ban action=drop comment="f2b-mikrotik: descarta IPs banidos pelo fail2ban"
 
 # Conferir:

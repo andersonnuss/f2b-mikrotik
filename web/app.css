@@ -275,3 +275,25 @@ details.history ul { margin: 4px 0 0; padding-left: 16px; }
 .chart .l1, .chart .l2 { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
 .chart .l1 { stroke: var(--series-1); }
 .chart .l2 { stroke: var(--series-2); }
+
+/* login, usuario logado e formularios de configuracao */
+.login-page { display: grid; place-items: center; min-height: 100vh; padding: 16px; }
+.login-box { width: min(360px, 100%); padding: 24px; }
+.login-box .brand { margin-bottom: 18px; }
+.login-box form { display: flex; flex-direction: column; gap: 12px; }
+.login-box label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+.login-box input { font-size: 15px; color: var(--text); }
+.user-menu { display: flex; align-items: center; gap: 8px; padding-left: 12px; border-left: 1px solid var(--border); }
+.form-grid .span-2 { grid-column: 1 / -1; }
+.form-grid select { color: var(--text); font-size: 14px; }
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; margin: 0; }
+.kv dt { color: var(--muted); font-size: 13px; }
+.kv dd { margin: 0; word-break: break-all; }
+[hidden] { display: none !important; }
+@media (max-width: 640px) {
+  .user-menu { border-left: 0; padding-left: 0; flex-wrap: wrap; }
+}
+/* itens de grid encolhem abaixo do conteudo; listas quebram linha em telas estreitas */
+.grid-2 > *, .stats > *, .router-cards > * { min-width: 0; }
+.bl-item { flex-wrap: wrap; }
+.bl-form select { min-width: 0; }

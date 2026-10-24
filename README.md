@@ -1,85 +1,170 @@
 # f2b-mikrotik
 
-Replica no MikroTik (RB750) os IPs banidos e liberados pelo fail2ban, para que o bloqueio aconteça **na borda**.
-Pode replicar para vários MikroTiks e tem um **painel web** para consultar o que está bloqueado e cadastrar roteadores.
+Replica nos MikroTiks os IPs banidos e liberados pelo fail2ban, para que o bloqueio aconteça **na borda**. Tem um **painel web**, com usuários, papéis e auditoria, para consultar o que está bloqueado, desbanir IPs e manter roteadores, blacklist, whitelist e configurações.
 
 ```
- fail2ban (servidor Linux)                      MikroTik RB750
+ fail2ban (servidor Linux)                         MikroTiks
  ┌──────────────────────────┐   API 8728/8729   ┌────────────────────────────────────┐
  │ /var/log/fail2ban.log ───┼─► f2b_mikrotik ──►│ /ip firewall address-list fail2ban │
- │ fail2ban-client banned ──┘   (daemon)        │ /ip firewall raw  drop src-list    │
- └──────────────────────────┘                   └────────────────────────────────────┘
+ │ fail2ban-client banned ──┘   (daemon)   ▲    │ /ip firewall raw  drop src-list    │
+ └──────────────────────────┘              │    └────────────────────────────────────┘
+          painel web (f2b_web.py) ──► config.db (SQLite): roteadores, blacklist, whitelist,
+                                      configurações, usuários e auditoria
 ```
 
-## Por que daemon (e não cron)
+## Como funciona
 
-| | Daemon (systemd) | Cron |
-|---|---|---|
-| Tempo até bloquear na borda | ~2 s (lê o log em tempo real) | até 1 min (menor intervalo do cron) |
-| Recuperação de falhas | automática, re-tenta a cada 15 s | só na próxima execução |
-| Supervisão | `systemctl status`, reinicia sozinho | nenhuma |
+O agente roda como daemon (systemd) e faz duas coisas:
 
-O agente faz as duas coisas:
-
-1. **Eventos**: acompanha o `fail2ban.log` (`Ban`, `Unban`, `Restore Ban`) e sincroniza ~2 s depois.
-2. **Reconciliação**: a cada 60 s compara o que está banido no fail2ban (`fail2ban-client`) com a address-list do roteador e corrige diferenças. Por isso nada se perde se o roteador cair, o agente reiniciar ou o log rotacionar.
-
-O modo cron continua disponível (`--once`), se preferir.
+1. **Eventos:** acompanha o `fail2ban.log` (`Ban`, `Unban`, `Restore Ban`) e sincroniza ~2 s depois. Faz o mesmo quando algo muda no painel.
+2. **Reconciliação:** a cada 60 s (configurável), compara o que deveria estar bloqueado (fail2ban + blacklist − whitelist) com a address-list de **cada** roteador e corrige as diferenças. Por isso nada se perde se um roteador cair, o agente reiniciar ou o log rotacionar.
 
 ### Garantias de segurança
 
-- Só altera entradas cujo comentário começa com `f2b-agent`. **Entradas manuais na mesma lista ficam intactas.**
-- Se o `fail2ban-client` falhar (serviço parado/reiniciando), **nada é removido** do roteador.
-- `whitelist` impede que redes internas/gerência sejam bloqueadas na borda.
-- IP banido em mais de uma jail só sai do roteador quando for liberado em todas.
-- O usuário no MikroTik tem só a permissão `api,read,write` e só aceita login a partir do IP do servidor.
-- Com vários roteadores, um fora do ar não atrapalha os outros: ele recebe tudo quando voltar.
+- **Entradas manuais preservadas:** o agente só altera entradas cujo comentário começa com `f2b-agent`. As demais entradas da mesma lista ficam intactas.
+- **Fail2ban fora do ar:** se o `fail2ban-client` falhar, **nada é removido** dos roteadores.
+- **Vários roteadores:** um roteador fora do ar não atrapalha os outros, e recebe tudo quando voltar.
+- **Configuração sensível fica no servidor:** o que pode dar controle do servidor (caminhos de comandos e arquivos usados como root, porta e TLS do painel) **não** é editável pela web. Fica no `config.ini`.
+- **Senhas protegidas:** as senhas dos roteadores nunca vão para o navegador, e as dos usuários são guardadas com hash PBKDF2.
+- **Auditoria completa:** toda ação, de pessoas e do agente, fica registrada.
 
 ## Instalação
 
 ### 1. MikroTik
 
-Edite os valores em [mikrotik-setup.rsc](mikrotik-setup.rsc) (IP do servidor, senha, interface WAN) e cole no terminal do Winbox. Ele cria:
-- grupo `f2b-api` e usuário `f2b-agent` (login só a partir do servidor);
-- API liberada apenas para o servidor;
-- regra `/ip firewall raw` que descarta `src-address-list=fail2ban` vindo da WAN. A tabela RAW age antes do conntrack e do NAT: gasta menos CPU no RB750 e vale também para portas redirecionadas (dst-nat).
+Edite [mikrotik-setup.rsc](mikrotik-setup.rsc) (IP do servidor, senha, interface WAN) e cole no terminal de cada roteador. Ele cria:
+- o usuário `f2b-agent`, com permissão só de API, e que só aceita login a partir do servidor;
+- a liberação da API para o servidor;
+- a regra `/ip firewall raw` que descarta `src-address-list=fail2ban` vinda da WAN.
 
 ### 2. Servidor Linux
 
-Requisitos: Python 3.6+ (sem bibliotecas extras) e fail2ban. Rodar como root, pois o `fail2ban-client` precisa disso.
+Requisitos: Python 3.7+ (sem bibliotecas extras) e fail2ban. Tudo roda como root, porque o `fail2ban-client` exige.
 
 ```bash
 sudo sh install.sh
 ```
 
 ```bash
-sudo nano /etc/f2b-mikrotik/config.ini
+sudo systemctl enable --now f2b-mikrotik f2b-mikrotik-web
 ```
+
+Abra `http://IP-DO-SERVIDOR:8088/` e entre com o usuário **admin** e a senha que o `install.sh` mostrou. Depois:
+1. Na aba **Roteadores**, cadastre os MikroTiks e use **Testar conexão**.
+2. Na aba **Configurações**, revise a whitelist: ela já vem com as redes privadas.
+3. Na aba **Usuários**, crie um usuário para cada pessoa e troque a senha do admin.
+
+Para conferir, sem alterar nada:
 
 ```bash
 sudo python3 /opt/f2b-mikrotik/f2b_mikrotik.py --test
 ```
 
-O `--test` não altera nada. Deve mostrar algo assim:
-
-```
-fail2ban ... OK - 37 IP(s) banido(s) a replicar
-MikroTik 192.168.88.1:8728 ... OK - RB750Gr3 RouterOS 7.16 (stable)
-  lista 'fail2ban': 0 entrada(s) do agente, 0 outra(s)
-  a adicionar: 37   a remover: 0
-```
-
-Opcional, para ver o que seria feito sem alterar o roteador:
+### Atualização a partir da 1.x
 
 ```bash
-sudo python3 /opt/f2b-mikrotik/f2b_mikrotik.py --once --dry-run -v
+cd /opt/f2b-mikrotik && git pull && sh install.sh && systemctl restart f2b-mikrotik f2b-mikrotik-web
 ```
 
-Ativar o serviço:
+Na primeira subida da 2.0, a configuração atual é **importada automaticamente** para `/var/lib/f2b-mikrotik/config.db`:
+- o roteador do `[mikrotik]` e os do `routers.json`;
+- a blacklist do `blacklist.txt`;
+- a whitelist, os intervalos, as jails, o país e o token do ipinfo do `config.ini`;
+- o usuário **admin**, com a senha atual de `[web] password`.
+
+A importação é registrada na auditoria e no log. Depois dela, `routers.json`, `blacklist.txt` e essas opções do `config.ini` **deixam de ser usados**; tudo passa a ser editado no painel. Os arquivos antigos não são apagados.
+
+## Painel web
+
+Roda na porta **8088**, sem Node e sem dependências. O login é por sessão: o cookie é `HttpOnly` e `SameSite=Strict`, a sessão expira após 8 h sem uso, e há o botão **Sair**. Depois de 5 senhas erradas em 15 minutos, o IP fica bloqueado por 15 minutos.
+
+### Papéis
+
+| | leitura | operador | administrador |
+|---|:-:|:-:|:-:|
+| Visão geral, consulta de IP, estatísticas, log do agente | ✓ | ✓ | ✓ |
+| Desbanir IP no fail2ban | | ✓ | ✓ |
+| Incluir e remover da blacklist | | ✓ | ✓ |
+| Whitelist, roteadores, configurações | | | ✓ |
+| Usuários e auditoria | | | ✓ |
+
+Cada usuário pode **trocar a própria senha**, e ao trocá-la suas outras sessões são encerradas. Desativar um usuário, mudar seu papel ou redefinir sua senha também derruba as sessões dele na hora. O sistema não deixa excluir, desativar ou rebaixar o **último administrador**.
+
+### Abas
+
+- **Este IP está bloqueado?** Diz em quais roteadores o IP está bloqueado e por quê: jail, blacklist (com a validade) ou dentro de uma rede bloqueada. Mostra também país, provedor e histórico. Avisa quando o IP deveria estar bloqueado e não está, ou quando está na whitelist, e traz botões para desbanir e para incluir na blacklist ou tirar dela.
+- **Visão geral:** o estado de cada roteador e a tabela única de bloqueios, com fail2ban, blacklist e cada MikroTik, mais país e quantidade de bloqueios. Tem também a blacklist, com o formulário para incluir.
+- **Estatísticas:** bloqueios e desbloqueios por hora, IPs mais bloqueados, bloqueios por país e por jail, e os últimos eventos.
+- **Roteadores:** cadastrar, editar, testar a conexão e excluir MikroTiks. Todos recebem os mesmos bloqueios.
+- **Configurações:** intervalos, validade da entrada no roteador, jails replicadas, IPv6, retenção do histórico e da auditoria, fonte do país (RIRs ou ipinfo) e token do ipinfo. Também a **whitelist**, com inclusão e remoção.
+- **Usuários:** cadastrar, editar (papel, nome, ativo, nova senha) e excluir usuários.
+- **Auditoria:** a trilha completa, com filtros por usuário, tipo de ação, texto e período, e exportação em **CSV**.
+- **Log do agente:** as últimas linhas do `/var/log/f2b-mikrotik.log`.
+
+### Blacklist
+
+Bloqueia IPs ou redes que o fail2ban não pegou, em todos os MikroTiks, em ~2 s.
+- **Validade:** cada inclusão pode ter validade de 1 hora, 6 horas, 1 dia, 7 dias, 30 dias ou 90 dias, ou ser **permanente**. Quando vence, o agente remove a entrada sozinho e registra na auditoria.
+- **Recusas:** o painel recusa entradas que estão na whitelist e redes maiores que /8.
+- **Rede da blacklist:** um IP banido pelo fail2ban que já está dentro de uma rede da blacklist não é duplicado no roteador.
+
+### Whitelist
+
+São IPs e redes que o agente **nunca** bloqueia, nem pelo fail2ban nem pela blacklist.
+- **Ao incluir:** o painel avisa quais entradas da blacklist deixam de valer.
+- **Ao remover:** se a entrada contém o seu próprio IP, o painel pede uma confirmação extra.
+- **Recusas:** redes maiores que /8 (IPv4) são recusadas, porque fariam o agente parar de bloquear boa parte da internet.
+
+### Auditoria
+
+Tudo fica registrado com data e hora, usuário, IP de origem, ação, alvo e detalhes:
+
+| Grupo | Ações |
+|---|---|
+| Acesso | `login.ok`, `login.falha`, `login.bloqueado`, `logout`, `acesso.negado` |
+| Usuários | `usuario.criado` / `alterado` / `removido` / `senha_redefinida`, `senha.alterada` / `falha` |
+| Configuração | `config.alterada` (valor antigo → novo; o token aparece como `********`) |
+| Roteadores | `roteador.criado` / `alterado` / `removido` / `limpeza_falhou` |
+| Listas | `blacklist.incluido` / `removido` / `expirado`, `whitelist.incluido` / `removido` |
+| Operação | `fail2ban.unban`, `auditoria.exportada` |
+| Agente | `agente.bloqueio` / `liberacao` (por roteador), `agente.erro`, `agente.iniciado` / `encerrado` |
+| Sistema | `sistema.migracao`, `painel.iniciado` |
+
+Os registros são guardados por 365 dias, valor que dá para mudar em Configurações.
+
+### Recuperar o acesso
+
+Se você perder a senha do admin, rode no servidor:
 
 ```bash
-sudo systemctl enable --now f2b-mikrotik
+sudo python3 /opt/f2b-mikrotik/f2b_mikrotik.py --reset-password admin
 ```
+
+O comando pede a nova senha. Se o usuário não existir, ele é criado como administrador. A ação é registrada na auditoria como feita pelo `terminal`.
+
+### HTTPS
+
+Sem certificado, o tráfego é HTTP puro, incluindo o login. Fora da rede interna, configure o HTTPS em `[web] tls_cert` / `tls_key` no `config.ini`.
+
+## O que fica no config.ini
+
+Só o que não pode ser alterado pela web:
+
+| Seção | Opções |
+|---|---|
+| `[mikrotik]` | `address_list`, `comment_prefix` |
+| `[fail2ban]` | `client` (comando executado como root), `logfile` |
+| `[agent]` | `config_db`, `events_db`, `logfile`, `log_level`, `lockfile` |
+| `[web]` | `bind`, `port` (padrão 8088), `tls_cert`, `tls_key`, `geo_file` e `password` (senha **inicial** do admin, usada só na primeira subida) |
+
+## Observabilidade
+
+O agente grava num histórico (`events.db`) cada bloqueio e desbloqueio, tanto do fail2ban quanto da blacklist. Na primeira execução, importa o que ainda estiver no `fail2ban.log` e nos logs rotacionados. A partir disso, o painel mostra quantas vezes cada IP foi bloqueado, o país de origem e os bloqueios e desbloqueios por hora.
+
+**País de origem:**
+- **Padrão (tabelas dos RIRs):** tabelas públicas de alocação dos cinco registros regionais (ARIN, RIPE, LACNIC, APNIC, AFRINIC). São baixadas uma vez por semana e consultadas localmente, então nenhum IP sai do servidor. O servidor precisa de acesso HTTPS a `ftp.arin.net`, `ftp.ripe.net`, `ftp.lacnic.net`, `ftp.apnic.net` e `ftp.afrinic.net`.
+- **Opcional (ipinfo Lite):** em Configurações, escolha **ipinfo Lite** e informe o token gratuito de https://ipinfo.io/signup. Dá a geolocalização, mais precisa para nuvens, e o provedor (ASN). Cada IP público é consultado uma vez e fica em cache. Se a API falhar, vale o país dos RIRs. Com essa opção, os IPs bloqueados são enviados ao ipinfo.io.
+- **Desconhecido:** IP privado ou reservado, ou não encontrado.
 
 ## Acompanhando o log
 
@@ -88,184 +173,26 @@ tail -f /var/log/f2b-mikrotik.log
 ```
 
 ```
-2026-10-23 19:23:34 [INFO] f2b-mikrotik 1.0.0 iniciado: roteador=192.168.88.1:8728 lista=fail2ban jails=todas
-2026-10-23 19:23:36 [INFO] fail2ban: [sshd] Ban 203.0.113.77
-2026-10-23 19:23:37 [INFO] BLOQUEADO no MikroTik [principal]: 203.0.113.77 (jail: sshd)
-2026-10-23 19:23:37 [INFO] sincronizacao por evento [principal]: 2 a bloquear (fail2ban + blacklist), 2 no roteador | +1 -0, 0 erro(s)
-2026-10-23 20:23:37 [INFO] fail2ban: [sshd] Unban 203.0.113.77
-2026-10-23 20:23:39 [INFO] LIBERADO no MikroTik [principal]: 203.0.113.77 (f2b-agent [sshd] 2026-10-23 19:23:37)
-2026-10-23 20:25:10 [WARNING] IGNORADO 192.168.1.50 (esta na whitelist) - nao sera bloqueado no MikroTik
-2026-10-23 20:40:00 [ERROR] falha ao comunicar com o MikroTik [filial] 10.0.0.1:8728: timed out (nova tentativa em 15s)
-2026-10-23 20:41:15 [INFO] comunicacao com o MikroTik [filial] restabelecida
+2026-10-24 17:58:13 [INFO] f2b-mikrotik 2.0.0 iniciado: lista=fail2ban jails=todas
+2026-10-24 17:58:13 [INFO] roteadores: sede (192.168.1.254:8728), filial (10.0.0.1:8728)
+2026-10-24 17:58:15 [INFO] fail2ban: [sshd] Ban 203.0.113.77
+2026-10-24 17:58:16 [INFO] BLOQUEADO no MikroTik [sede]: 203.0.113.77 (jail: sshd)
+2026-10-24 17:58:16 [INFO] BLOQUEADO no MikroTik [filial]: 203.0.113.77 (jail: sshd)
+2026-10-24 18:02:40 [INFO] configuracao atualizada pelo painel; roteadores: sede (...), filial (...), loja (...)
+2026-10-24 18:40:00 [ERROR] falha ao comunicar com o MikroTik [filial] 10.0.0.1:8728: timed out (nova tentativa em 15s)
 ```
 
-- O arquivo rotaciona sozinho (10 MB x 5 arquivos, configurável).
-- Sincronizações sem alteração só aparecem com `log_level = DEBUG`.
-- Erros repetidos são registrados no máximo a cada 5 minutos, para não encher o log.
-- Erros de partida (configuração, Python) aparecem em `journalctl -u f2b-mikrotik`.
+Erros de partida e a migração também aparecem em `journalctl -u f2b-mikrotik` e `journalctl -u f2b-mikrotik-web`.
 
-No roteador:
+## Outros modos do agente
 
-```
-/ip firewall address-list print where list=fail2ban
-/ip firewall raw print stats
-```
-
-## Painel web
-
-Painel para conferir o que está bloqueado, desbanir IPs, editar a blacklist e cadastrar outros MikroTiks. Usa o próprio Python, sem Node e sem dependências, e roda na **porta 8088**.
-
-```bash
-sudo systemctl enable --now f2b-mikrotik-web
-```
-
-Abra `http://IP-DO-SERVIDOR:8088/` e entre com o usuário `admin` e a senha da seção `[web]` do `/etc/f2b-mikrotik/config.ini`. O `install.sh` gera essa senha e a mostra na tela; ela pode ser trocada no arquivo.
-
-O que o painel mostra e faz:
-
-- **Este IP está bloqueado?** Digite um IP ou uma rede. A resposta diz em quais roteadores está bloqueado, por quê (jail do fail2ban, blacklist, ou dentro de uma rede bloqueada) e avisa quando o IP deveria estar bloqueado e ainda não está, ou quando está na whitelist. O resultado traz botões para **desbanir** e para **incluir na blacklist** ou **tirar dela**.
-- **Visão geral:** estado de cada roteador e uma tabela única de **bloqueios**. Para cada IP ou rede, mostra:
-  - as jails do fail2ban em que está banido;
-  - se está na blacklist;
-  - o estado em cada MikroTik: bloqueado, manual, faltando ou a remover.
-
-  Os IPs banidos que o agente não replica também aparecem, com o motivo: whitelist, jail fora da lista ou coberto por uma rede da blacklist. Cada linha tem os botões **Desbanir**, **+ Blacklist** e **Tirar da blacklist**. O filtro "só divergências" mostra o que o agente ainda não sincronizou.
-- **Blacklist:** um formulário para incluir um IP ou uma rede com o motivo, e a lista com o botão **Remover**. O painel edita o `blacklist.txt` preservando as linhas e os comentários existentes. Ele recusa entradas que estão na whitelist e redes grandes demais (maiores que /8 no IPv4).
-- **Roteadores:** cadastrar, editar, testar a conexão e excluir MikroTiks.
-- **Log do agente:** as últimas linhas do `/var/log/f2b-mikrotik.log`, com filtro.
-
-Como as ações chegam aos roteadores:
-
-| Ação no painel | O que o painel faz | O que acontece nos MikroTiks |
-|---|---|---|
-| Desbanir | roda `fail2ban-client set <jail> unbanip <ip>` em todas as jails em que o IP está | o agente libera em ~2 s. Se o IP também estiver na blacklist, ele continua bloqueado (o painel avisa). |
-| Incluir na blacklist | acrescenta a linha `IP  # motivo (usuário, data)` ao arquivo | o agente bloqueia em ~2 s |
-| Tirar da blacklist | remove a linha do arquivo | o agente libera em ~2 s. Se o IP também estiver banido no fail2ban, ele continua bloqueado (o painel avisa). |
-
-Cada ação fica registrada no journal do painel (`journalctl -u f2b-mikrotik-web`), com o usuário e o IP de origem.
-
-Configuração (`[web]` no `config.ini`):
-
-| Opção | Padrão | |
-|---|---|---|
-| `port` | `8088` | troque se a porta estiver em uso (a 3000 não é usada) |
-| `bind` | `0.0.0.0` | `127.0.0.1` aceita só acessos do próprio servidor |
-| `username` / `password` | `admin` / *(gerada)* | o painel não inicia sem senha |
-| `tls_cert` / `tls_key` | *(vazio)* | caminhos do certificado e da chave para usar HTTPS |
-
-Segurança: o painel exige senha e recusa pedidos forjados por outros sites. As senhas dos roteadores nunca são enviadas ao navegador. Sem `tls_cert`, porém, o tráfego é HTTP puro: use o painel só na rede interna, ou configure o HTTPS. Quem tem a senha pode desbanir IPs e editar a blacklist, então proteja-a como protegeria o acesso ao servidor.
-
-## Observabilidade
-
-O agente grava cada evento num histórico local (`/var/lib/f2b-mikrotik/events.db`, SQLite):
-
-- **bloqueio** e **desbloqueio** do fail2ban (`Ban` / `Unban`);
-- **inclusão** e **remoção** na blacklist, contadas também como bloqueio e desbloqueio.
-
-As restaurações de ban após um reinício do fail2ban (`Restore Ban`) ficam guardadas, mas não entram nas contagens, para não contar duas vezes o mesmo ban. Na primeira execução, o agente importa o que ainda estiver no `fail2ban.log` e nos logs rotacionados (inclusive os `.gz`), para que as contagens não comecem do zero. Por padrão, o histórico guarda 365 dias.
-
-No painel:
-
-| Onde | O que mostra |
+| Comando | Para quê |
 |---|---|
-| Tabela de bloqueios | colunas **país** e **bloqueios** (quantas vezes o IP foi bloqueado), com ordenação por "mais bloqueados", "mais recente" ou "país" |
-| Consulta de IP | o país e o histórico (bloqueado N vezes, primeira e última vez, número de desbloqueios e os últimos eventos) |
-| Aba **Estatísticas** | bloqueios e desbloqueios na última hora e no período, média por hora e IPs distintos; gráfico **por hora** (24 h em barras, 7 dias em linhas), com tooltip e tabela; IPs mais bloqueados, bloqueios por país e por jail; últimos eventos |
-
-**País de origem:** vem das tabelas públicas de alocação dos cinco registros regionais (ARIN, RIPE NCC, LACNIC, APNIC e AFRINIC). O painel baixa essas tabelas (~45 MB) na primeira vez e depois uma vez por semana. Elas viram um arquivo de ~1,3 MB em `/var/lib/f2b-mikrotik/geo.tsv.gz`, e toda consulta é local: nenhum IP sai do servidor e não é preciso conta nem chave. É o país em que o bloco de IPs foi registrado, o que na prática corresponde ao país do provedor. Fica como **desconhecido** quando o IP é privado ou reservado, quando não está nas tabelas, ou enquanto a tabela ainda não foi baixada. Para isso funcionar, o servidor precisa acessar `ftp.arin.net`, `ftp.ripe.net`, `ftp.lacnic.net`, `ftp.apnic.net` e `ftp.afrinic.net` por HTTPS. Para baixar ou consultar manualmente:
-
-```bash
-sudo python3 /opt/f2b-mikrotik/f2b_geo.py --update 45.155.205.233
-```
-
-**Opcional: país pela API gratuita ipinfo Lite.** As tabelas dos RIRs dão o país do **registro** do bloco de IPs. O ipinfo dá o país da **localização** estimada, que é mais preciso para nuvens e grandes provedores: um IP da AWS em São Paulo aparece como Brasil, e não como EUA. Para ativar:
-
-1. Crie um token gratuito em https://ipinfo.io/signup.
-2. No `config.ini`, coloque:
-
-```ini
-[web]
-geo_provider = ipinfo
-ipinfo_token = SEU_TOKEN
-```
-
-3. Reinicie o painel: `systemctl restart f2b-mikrotik-web`.
-
-Como funciona:
-- **Cache:** cada IP **público** é consultado uma única vez, e a resposta fica guardada por 30 dias (`geo_cache_days`) em `/var/lib/f2b-mikrotik/geo_cache.db`. IPs privados e reservados nunca são enviados, e o token não aparece no log.
-- **Sem esperar a API:** as consultas rodam em segundo plano, em no máximo 5 por segundo. Enquanto um IP ainda não foi consultado, o painel mostra o país dos RIRs; na recarga seguinte, já mostra o do ipinfo.
-- **Provedor do IP:** a consulta de IP mostra também o ASN e o nome do provedor, por exemplo `AS16509 Amazon.com, Inc.`.
-- **Falhas:** se o ipinfo responder "limite atingido", as consultas param por 10 minutos. Se recusar o token, o ipinfo é desligado até o painel ser reiniciado. Se estiver fora do ar, as consultas são retomadas 1 minuto depois. Em todos esses casos, vale o país dos RIRs, e o motivo aparece na aba Estatísticas.
-- **Privacidade:** com o ipinfo ativo, os IPs bloqueados são enviados a um serviço externo. Na maioria são atacantes, mas um cliente seu que errou a senha também entra na lista. Se isso for um problema, mantenha `geo_provider = rir`.
-
-O histórico só é registrado no modo daemon (serviço `f2b-mikrotik`). No modo cron (`--once`), não há registro de eventos.
-
-## Vários MikroTiks
-
-O roteador do `config.ini` (seção `[mikrotik]`) é o **principal**. Os demais são cadastrados no painel, na aba **Roteadores**, e ficam em `/etc/f2b-mikrotik/routers.json` (permissão 600, porque contém as senhas).
-
-- **Recebem tudo:** todos os roteadores recebem os mesmos bloqueios, do fail2ban e da blacklist.
-- **Novo roteador:** o agente percebe o cadastro em cerca de 2 s e envia para ele tudo o que já está bloqueado. Não precisa reiniciar o serviço.
-- **Desabilitar:** o roteador para de receber bloqueios, mas os que já estão nele ficam lá.
-- **Excluir:** por padrão, também remove do roteador os bloqueios criados pelo agente.
-- **Preparação:** cada roteador precisa ser preparado com o [mikrotik-setup.rsc](mikrotik-setup.rsc), como o principal. Ele precisa do usuário, da API liberada para o IP do servidor e da regra raw.
-
-```
-/ip firewall address-list print where list=fail2ban
-```
-
-## Blacklist: bloqueios manuais
-
-Para bloquear no MikroTik IPs ou redes que o fail2ban não pegou, edite o arquivo:
-
-```bash
-sudo nano /etc/f2b-mikrotik/blacklist.txt
-```
-
-Use um IP ou uma rede por linha. O texto depois de `#` é comentário:
-
-```
-203.0.113.45              # scanner insistente
-198.51.100.0/24           # rede inteira
-```
-
-- Ao salvar, o agente percebe a mudança em cerca de 2 segundos e atualiza o roteador. Não precisa reiniciar o serviço.
-- Apagar ou comentar a linha libera o IP no roteador.
-- No MikroTik, essas entradas aparecem com o comentário `f2b-agent [blacklist] ...`.
-- Se uma entrada cair na `whitelist`, ela é ignorada e o motivo fica registrado no log.
-- Um IP banido pelo fail2ban que já está dentro de uma rede da blacklist não é duplicado no roteador.
-- Se o fail2ban estiver fora do ar, a blacklist continua sendo aplicada, mas nada é removido do roteador.
-
-```
-2026-10-23 21:02:10 [INFO] blacklist /etc/f2b-mikrotik/blacklist.txt alterada
-2026-10-23 21:02:12 [INFO] BLOQUEADO no MikroTik: 198.51.100.0/24 (jail: blacklist)
-```
-
-## Alternativa: cron
-
-Em vez do serviço, rode a cada minuto (`crontab -e` do root):
-
-```
-* * * * * /usr/bin/python3 /opt/f2b-mikrotik/f2b_mikrotik.py --once
-```
-
-Uma trava (`/run/f2b-mikrotik.lock`) impede duas execuções simultâneas.
-
-## Opções úteis do config.ini
-
-| Opção | Para que serve |
-|---|---|
-| `jails` | replicar só algumas jails (ex.: `sshd, postfix`) |
-| `whitelist` | redes que nunca vão para o roteador |
-| `[blacklist] file` | arquivo de bloqueios manuais (vazio desativa) |
-| `[mikrotik] name` | nome do roteador principal no log e no painel |
-| `[agent] routers_file` | arquivo dos roteadores cadastrados pelo painel |
-| `[agent] events_db` / `events_retention_days` | histórico de eventos e por quantos dias guardar |
-| `[web] geoip` / `geo_file` | país de origem (tabelas dos RIRs) |
-| `[web] geo_provider` / `ipinfo_token` / `geo_cache_days` | país via API ipinfo Lite, com cache e com as tabelas dos RIRs como reserva |
-| `entry_timeout` | ex.: `7d`. As entradas expiram sozinhas no roteador se o agente for desinstalado ou parar; enquanto o IP seguir banido, o agente o recoloca |
-| `ipv6` | replica também para `/ipv6 firewall address-list` |
-| `use_ssl` / `port` | usar `api-ssl` (8729) |
+| `--test` | testa banco, fail2ban e roteadores, sem alterar nada |
+| `--once` | uma sincronização e sai (modo cron, sem histórico de eventos) |
+| `--dry-run -v` | mostra o que faria, sem alterar os roteadores |
+| `--flush` | remove de todos os roteadores as entradas criadas pelo agente |
+| `--reset-password USUARIO` | recupera o acesso ao painel |
 
 ## Remover tudo
 
@@ -277,9 +204,7 @@ sudo systemctl disable --now f2b-mikrotik f2b-mikrotik-web
 sudo python3 /opt/f2b-mikrotik/f2b_mikrotik.py --flush
 ```
 
-O `--flush` remove de todos os roteadores só as entradas criadas pelo agente.
-
 ## Observações
 
-- Ao **parar** o fail2ban, ele libera todos os IPs. O agente então os remove do roteador. Quando o fail2ban volta, os bans persistentes (`Restore Ban`) são recolocados.
-- Compatível com RouterOS v6 (inclusive anterior à 6.43) e v7. Testa automaticamente o comando `fail2ban-client banned` (0.11.2+) e recorre ao `status` em versões antigas.
+- **Parar o fail2ban libera tudo:** ao parar, o fail2ban libera todos os IPs, e o agente os remove dos roteadores. Quando o fail2ban volta, os bans persistentes (`Restore Ban`) são recolocados.
+- **Compatibilidade:** funciona com RouterOS v6 (inclusive anterior à 6.43) e v7, e com fail2ban 0.10 ou mais novo.

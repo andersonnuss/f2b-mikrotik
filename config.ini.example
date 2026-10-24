@@ -1,83 +1,43 @@
-; Configuracao do f2b-mikrotik  ->  /etc/f2b-mikrotik/config.ini  (chmod 600: contem senha)
+; Configuracao do f2b-mikrotik  ->  /etc/f2b-mikrotik/config.ini  (chmod 600)
+;
+; A partir da versao 2.0, roteadores, blacklist, whitelist, intervalos, pais de origem,
+; usuarios e auditoria ficam no banco (config_db) e sao editados no PAINEL.
+; Aqui fica so o que, por seguranca, nao pode ser alterado pela web: caminhos de comandos
+; e arquivos usados como root, e a porta/TLS do proprio painel.
 
-; Roteador principal. Outros MikroTiks que recebem os mesmos bloqueios sao cadastrados
-; pelo painel web (ficam em routers_file, secao [agent]).
 [mikrotik]
-; nome exibido no log e no painel
-name = principal
-host = 192.168.88.1
-; 8728 = api   |   8729 = api-ssl (use_ssl = yes)
-port = 8728
-use_ssl = no
-username = f2b-agent
-password = TROQUE-ESTA-SENHA
-timeout = 10
 ; address-list que recebe os IPs (a regra de drop no roteador usa este nome)
 address_list = fail2ban
 ; o agente so altera/remove entradas cujo comentario comeca com este prefixo
 comment_prefix = f2b-agent
-; validade da entrada no roteador (formato RouterOS: 1d, 12h, 30m). Vazio = permanente.
-; Rede de seguranca: se o agente parar, os bloqueios expiram sozinhos. Enquanto o IP
-; continuar banido no fail2ban, o agente o recoloca na proxima sincronizacao.
-entry_timeout =
-; replica tambem IPs IPv6 (/ipv6 firewall address-list). Exige o pacote ipv6 ativo no roteador.
-ipv6 = no
 
 [fail2ban]
 client = /usr/bin/fail2ban-client
 ; log acompanhado para reagir em segundos. Vazio = so sincronizacao periodica.
 logfile = /var/log/fail2ban.log
-; jails a replicar, separadas por virgula. Vazio = todas.
-jails =
-; IPs/redes que NUNCA serao bloqueados no roteador (rede interna, IP de gerencia, VPN...)
-whitelist = 127.0.0.0/8, ::1, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10
-
-[blacklist]
-; IPs/redes bloqueados sempre, independente do fail2ban: um por linha, '#' para comentarios.
-; Relido automaticamente ao ser salvo. Vazio = recurso desativado.
-file = /etc/f2b-mikrotik/blacklist.txt
 
 [agent]
-; reconciliacao completa fail2ban x roteador (segundos)
-sync_interval = 60
-; espera apos um evento do log antes de sincronizar (agrupa rajadas de bans)
-debounce = 2
-; nova tentativa apos falha (segundos)
-retry_delay = 15
+; banco da configuracao editavel pelo painel (roteadores, listas, usuarios, auditoria)
+config_db = /var/lib/f2b-mikrotik/config.db
+; historico de bloqueios/desbloqueios (contagens e estatisticas)
+events_db = /var/lib/f2b-mikrotik/events.db
 logfile = /var/log/f2b-mikrotik.log
 ; DEBUG mostra tambem as sincronizacoes sem alteracao
 log_level = INFO
 log_max_bytes = 10485760
 log_backups = 5
 lockfile = /run/f2b-mikrotik.lock
-; roteadores adicionais cadastrados pelo painel (relido sozinho quando muda)
-routers_file = /etc/f2b-mikrotik/routers.json
-; historico de bloqueios/desbloqueios (contagens e estatisticas do painel). Vazio = desativado.
-; Na primeira execucao importa o que ainda estiver no fail2ban.log e nos logs rotacionados.
-events_db = /var/lib/f2b-mikrotik/events.db
-; eventos mais antigos que isso sao apagados (0 = guardar tudo)
-events_retention_days = 365
 
 [web]
 ; painel web (f2b_web.py). Use 127.0.0.1 para aceitar so acessos locais.
 bind = 0.0.0.0
 port = 8088
-username = admin
-; obrigatoria: o painel nao inicia sem senha
+; senha INICIAL do usuario admin, usada so na primeira subida (o install.sh gera uma).
+; Depois disso os usuarios sao gerenciados no painel (aba Usuarios). Para recuperar o acesso:
+;   python3 /opt/f2b-mikrotik/f2b_mikrotik.py --reset-password admin
 password =
 ; HTTPS opcional (recomendado fora da rede interna): caminhos do certificado e da chave
 tls_cert =
 tls_key =
-; pais de origem dos IPs, pelas tabelas publicas dos registros regionais (ARIN, RIPE, LACNIC,
-; APNIC, AFRINIC). O painel baixa ~45 MB uma vez por semana e consulta tudo localmente:
-; nenhum IP e enviado a terceiros. no = sem pais (aparece "desconhecido").
-geoip = yes
+; tabela de paises (baixada das tabelas publicas dos RIRs)
 geo_file = /var/lib/f2b-mikrotik/geo.tsv.gz
-; fonte do pais: rir = so as tabelas acima (offline) | ipinfo = API gratuita ipinfo Lite
-; (geolocalizacao mais precisa: um IP da AWS em Sao Paulo aparece como Brasil, nao EUA).
-; Com ipinfo, cada IP publico e enviado uma vez ao ipinfo.io e fica em cache; se a API falhar,
-; vale o pais das tabelas dos RIRs. Token gratuito em https://ipinfo.io/signup
-geo_provider = rir
-ipinfo_token =
-; por quantos dias a resposta do ipinfo fica em cache
-geo_cache_days = 30
