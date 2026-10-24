@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>f2b-mikrotik</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <header class="top">
+    <div class="brand">
+      <svg class="logo" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2 4 5v6c0 5 3.4 9.3 8 11 4.6-1.7 8-6 8-11V5l-8-3Zm-1 13-3.5-3.5 1.4-1.4L11 12.2l4.6-4.6 1.4 1.4L11 15Z"/></svg>
+      <span>f2b-mikrotik</span>
+      <span class="muted small" id="version"></span>
+    </div>
+    <div id="agent-status" class="pill">agente: …</div>
+    <div class="top-actions">
+      <span class="muted small" id="updated"></span>
+      <label class="check-inline"><input type="checkbox" id="auto"> atualizar a cada 30 s</label>
+      <button id="refresh" class="btn">Atualizar</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="card lookup">
+      <form id="check-form" autocomplete="off">
+        <label for="check-ip" class="lookup-label">Este IP está bloqueado?</label>
+        <div class="row">
+          <input id="check-ip" class="mono" placeholder="203.0.113.5 ou 198.51.100.0/24" spellcheck="false">
+          <button class="btn primary" type="submit">Consultar</button>
+        </div>
+      </form>
+      <div id="check-result" aria-live="polite"></div>
+    </section>
+
+    <nav class="tabs" role="tablist">
+      <button type="button" role="tab" data-tab="overview" class="active">Visão geral</button>
+      <button type="button" role="tab" data-tab="entries">Bloqueios <span class="count" id="count-entries"></span></button>
+      <button type="button" role="tab" data-tab="routers">Roteadores <span class="count" id="count-routers"></span></button>
+      <button type="button" role="tab" data-tab="log">Log do agente</button>
+    </nav>
+
+    <section id="tab-overview" class="tab active">
+      <div id="overview-error"></div>
+      <div class="stats" id="stats"></div>
+      <h2>Roteadores</h2>
+      <div class="router-cards" id="router-cards"></div>
+      <div class="grid-2">
+        <div class="card"><h2>fail2ban</h2><div id="f2b-box"></div></div>
+        <div class="card">
+          <h2>Blacklist</h2><div id="bl-box"></div>
+          <h2 class="mt">Whitelist <span class="muted small">(nunca bloqueados)</span></h2><div id="wl-box"></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="tab-entries" class="tab">
+      <div class="toolbar">
+        <input id="entries-filter" class="mono" placeholder="filtrar IP, rede ou jail" spellcheck="false">
+        <select id="entries-source">
+          <option value="">todas as origens</option>
+          <option value="fail2ban">fail2ban</option>
+          <option value="blacklist">blacklist</option>
+          <option value="router">só no roteador (manual)</option>
+        </select>
+        <label class="check-inline"><input type="checkbox" id="entries-diff"> só divergências</label>
+        <span class="muted small" id="entries-info"></span>
+      </div>
+      <div class="table-wrap"><table class="table" id="entries-table"></table></div>
+      <p class="muted small legend">
+        <span class="st st-ok">bloqueado</span> pelo agente ·
+        <span class="st st-info">manual</span> entrada criada fora do agente ·
+        <span class="st st-bad">faltando</span> deveria estar bloqueado e não está ·
+        <span class="st st-warn">a remover</span> já liberado, aguardando o agente ·
+        <span class="st st-muted">?</span> roteador fora do ar ou desabilitado
+      </p>
+    </section>
+
+    <section id="tab-routers" class="tab">
+      <div class="toolbar">
+        <button class="btn primary" id="router-add">+ Cadastrar MikroTik</button>
+        <span class="muted small">Todos os roteadores recebem os mesmos bloqueios. Prepare cada um com o <span class="mono">mikrotik-setup.rsc</span> (usuário, API e regra raw).</span>
+      </div>
+      <div class="table-wrap"><table class="table" id="routers-table"></table></div>
+    </section>
+
+    <section id="tab-log" class="tab">
+      <div class="toolbar">
+        <input id="log-filter" placeholder="filtrar (ex.: BLOQUEADO, 203.0.113.5, ERROR)" spellcheck="false">
+        <select id="log-lines">
+          <option value="200">200 linhas</option>
+          <option value="500" selected>500 linhas</option>
+          <option value="2000">2000 linhas</option>
+        </select>
+        <button class="btn" id="log-refresh">Recarregar</button>
+        <span class="muted small" id="log-file"></span>
+      </div>
+      <pre class="log" id="log-box"></pre>
+    </section>
+  </main>
+
+  <dialog id="router-dialog">
+    <form id="router-form" method="dialog" autocomplete="off">
+      <h2 id="router-dialog-title">Cadastrar MikroTik</h2>
+      <div class="form-grid">
+        <label>Nome<input name="name" required maxlength="40" placeholder="Filial Centro"></label>
+        <label>Endereço (IP ou DNS)<input name="host" required class="mono" placeholder="10.0.0.1"></label>
+        <label>Porta da API<input name="port" type="number" min="1" max="65535" placeholder="8728"></label>
+        <label>Timeout (s)<input name="timeout" type="number" min="1" max="60" step="1" placeholder="10"></label>
+        <label>Usuário<input name="username" required placeholder="f2b-agent"></label>
+        <label>Senha<input name="password" type="password" autocomplete="new-password"></label>
+        <label class="check-inline"><input type="checkbox" name="use_ssl"> usar api-ssl (porta 8729)</label>
+        <label class="check-inline"><input type="checkbox" name="enabled" checked> habilitado (recebe bloqueios)</label>
+      </div>
+      <div id="router-test-result"></div>
+      <div class="dialog-actions">
+        <button type="button" class="btn" id="router-test">Testar conexão</button>
+        <span class="spacer"></span>
+        <button type="button" class="btn" id="router-cancel">Cancelar</button>
+        <button type="submit" class="btn primary" id="router-save">Salvar</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="delete-dialog">
+    <form method="dialog">
+      <h2>Excluir <span id="delete-name"></span>?</h2>
+      <p>O roteador deixa de receber bloqueios.</p>
+      <label class="check-inline"><input type="checkbox" id="delete-flush" checked> remover dele os bloqueios criados pelo agente</label>
+      <div id="delete-error"></div>
+      <div class="dialog-actions">
+        <span class="spacer"></span>
+        <button type="button" class="btn" id="delete-cancel">Cancelar</button>
+        <button type="button" class="btn danger" id="delete-confirm">Excluir</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>

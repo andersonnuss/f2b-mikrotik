@@ -1,6 +1,7 @@
 # f2b-mikrotik
 
 Replica no MikroTik (RB750) os IPs banidos e liberados pelo fail2ban, para que o bloqueio aconteça **na borda**.
+Pode replicar para vários MikroTiks e tem um **painel web** para consultar o que está bloqueado e cadastrar roteadores.
 
 ```
  fail2ban (servidor Linux)                      MikroTik RB750
@@ -32,6 +33,7 @@ O modo cron continua disponível (`--once`), se preferir.
 - `whitelist` impede que redes internas/gerência sejam bloqueadas na borda.
 - IP banido em mais de uma jail só sai do roteador quando for liberado em todas.
 - O usuário no MikroTik tem só a permissão `api,read,write` e só aceita login a partir do IP do servidor.
+- Com vários roteadores, um fora do ar não atrapalha os outros: ele recebe tudo quando voltar.
 
 ## Instalação
 
@@ -88,13 +90,13 @@ tail -f /var/log/f2b-mikrotik.log
 ```
 2026-10-23 19:23:34 [INFO] f2b-mikrotik 1.0.0 iniciado: roteador=192.168.88.1:8728 lista=fail2ban jails=todas
 2026-10-23 19:23:36 [INFO] fail2ban: [sshd] Ban 203.0.113.77
-2026-10-23 19:23:37 [INFO] BLOQUEADO no MikroTik: 203.0.113.77 (jail: sshd)
-2026-10-23 19:23:37 [INFO] sincronizacao por evento: 2 banidos no fail2ban, 2 no roteador | +1 -0, 0 erro(s)
+2026-10-23 19:23:37 [INFO] BLOQUEADO no MikroTik [principal]: 203.0.113.77 (jail: sshd)
+2026-10-23 19:23:37 [INFO] sincronizacao por evento [principal]: 2 a bloquear (fail2ban + blacklist), 2 no roteador | +1 -0, 0 erro(s)
 2026-10-23 20:23:37 [INFO] fail2ban: [sshd] Unban 203.0.113.77
-2026-10-23 20:23:39 [INFO] LIBERADO no MikroTik: 203.0.113.77 (f2b-agent [sshd] 2026-10-23 19:23:37)
+2026-10-23 20:23:39 [INFO] LIBERADO no MikroTik [principal]: 203.0.113.77 (f2b-agent [sshd] 2026-10-23 19:23:37)
 2026-10-23 20:25:10 [WARNING] IGNORADO 192.168.1.50 (esta na whitelist) - nao sera bloqueado no MikroTik
-2026-10-23 20:40:00 [ERROR] falha ao comunicar com o MikroTik 192.168.88.1:8728: timed out (nova tentativa em 15s)
-2026-10-23 20:41:15 [INFO] comunicacao restabelecida
+2026-10-23 20:40:00 [ERROR] falha ao comunicar com o MikroTik [filial] 10.0.0.1:8728: timed out (nova tentativa em 15s)
+2026-10-23 20:41:15 [INFO] comunicacao com o MikroTik [filial] restabelecida
 ```
 
 - O arquivo rotaciona sozinho (10 MB x 5 arquivos, configurável).
@@ -107,6 +109,51 @@ No roteador:
 ```
 /ip firewall address-list print where list=fail2ban
 /ip firewall raw print stats
+```
+
+## Painel web
+
+Painel para conferir o que está bloqueado e cadastrar outros MikroTiks. Usa o próprio Python, sem Node e sem dependências, e roda na **porta 8088**.
+
+```bash
+sudo systemctl enable --now f2b-mikrotik-web
+```
+
+Abra `http://IP-DO-SERVIDOR:8088/` e entre com o usuário `admin` e a senha da seção `[web]` do `/etc/f2b-mikrotik/config.ini`. O `install.sh` gera essa senha e a mostra na tela; ela pode ser trocada no arquivo.
+
+O que o painel mostra:
+
+- **Este IP está bloqueado?** Digite um IP ou uma rede. A resposta diz em quais roteadores está bloqueado, por quê (jail do fail2ban, blacklist, ou dentro de uma rede bloqueada) e avisa quando o IP deveria estar bloqueado e ainda não está, ou quando está na whitelist.
+- **Visão geral:** estado de cada roteador (modelo, versão, identity, uptime), jails do fail2ban com os IPs banidos, blacklist e whitelist. Clique num IP para consultá-lo.
+- **Bloqueios:** uma tabela com todos os IPs e uma coluna por roteador (bloqueado, manual, faltando, a remover). O filtro "só divergências" mostra o que o agente ainda não sincronizou.
+- **Roteadores:** cadastrar, editar, testar a conexão e excluir MikroTiks.
+- **Log do agente:** as últimas linhas do `/var/log/f2b-mikrotik.log`, com filtro.
+
+O painel só **lê** o fail2ban e os roteadores. Quem bloqueia e libera é o agente.
+
+Configuração (`[web]` no `config.ini`):
+
+| Opção | Padrão | |
+|---|---|---|
+| `port` | `8088` | troque se a porta estiver em uso (a 3000 não é usada) |
+| `bind` | `0.0.0.0` | `127.0.0.1` aceita só acessos do próprio servidor |
+| `username` / `password` | `admin` / *(gerada)* | o painel não inicia sem senha |
+| `tls_cert` / `tls_key` | *(vazio)* | caminhos do certificado e da chave para usar HTTPS |
+
+Segurança: o painel exige senha e recusa pedidos forjados por outros sites. As senhas dos roteadores nunca são enviadas ao navegador. Sem `tls_cert`, porém, o tráfego é HTTP puro: use o painel só na rede interna, ou configure o HTTPS.
+
+## Vários MikroTiks
+
+O roteador do `config.ini` (seção `[mikrotik]`) é o **principal**. Os demais são cadastrados no painel, na aba **Roteadores**, e ficam em `/etc/f2b-mikrotik/routers.json` (permissão 600, porque contém as senhas).
+
+- **Recebem tudo:** todos os roteadores recebem os mesmos bloqueios, do fail2ban e da blacklist.
+- **Novo roteador:** o agente percebe o cadastro em cerca de 2 s e envia para ele tudo o que já está bloqueado. Não precisa reiniciar o serviço.
+- **Desabilitar:** o roteador para de receber bloqueios, mas os que já estão nele ficam lá.
+- **Excluir:** por padrão, também remove do roteador os bloqueios criados pelo agente.
+- **Preparação:** cada roteador precisa ser preparado com o [mikrotik-setup.rsc](mikrotik-setup.rsc), como o principal. Ele precisa do usuário, da API liberada para o IP do servidor e da regra raw.
+
+```
+/ip firewall address-list print where list=fail2ban
 ```
 
 ## Blacklist: bloqueios manuais
@@ -153,6 +200,8 @@ Uma trava (`/run/f2b-mikrotik.lock`) impede duas execuções simultâneas.
 | `jails` | replicar só algumas jails (ex.: `sshd, postfix`) |
 | `whitelist` | redes que nunca vão para o roteador |
 | `[blacklist] file` | arquivo de bloqueios manuais (vazio desativa) |
+| `[mikrotik] name` | nome do roteador principal no log e no painel |
+| `[agent] routers_file` | arquivo dos roteadores cadastrados pelo painel |
 | `entry_timeout` | ex.: `7d`. As entradas expiram sozinhas no roteador se o agente for desinstalado ou parar; enquanto o IP seguir banido, o agente o recoloca |
 | `ipv6` | replica também para `/ipv6 firewall address-list` |
 | `use_ssl` / `port` | usar `api-ssl` (8729) |
@@ -160,14 +209,14 @@ Uma trava (`/run/f2b-mikrotik.lock`) impede duas execuções simultâneas.
 ## Remover tudo
 
 ```bash
-sudo systemctl disable --now f2b-mikrotik
+sudo systemctl disable --now f2b-mikrotik f2b-mikrotik-web
 ```
 
 ```bash
 sudo python3 /opt/f2b-mikrotik/f2b_mikrotik.py --flush
 ```
 
-O `--flush` remove do roteador só as entradas criadas pelo agente.
+O `--flush` remove de todos os roteadores só as entradas criadas pelo agente.
 
 ## Observações
 

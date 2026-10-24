@@ -1,0 +1,17 @@
+[Unit]
+Description=Painel web do f2b-mikrotik
+After=network-online.target fail2ban.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/f2b-mikrotik/f2b_web.py -c /etc/f2b-mikrotik/config.ini
+Restart=always
+RestartSec=10
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

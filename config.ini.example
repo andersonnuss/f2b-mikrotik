@@ -1,6 +1,10 @@
 ; Configuracao do f2b-mikrotik  ->  /etc/f2b-mikrotik/config.ini  (chmod 600: contem senha)
 
+; Roteador principal. Outros MikroTiks que recebem os mesmos bloqueios sao cadastrados
+; pelo painel web (ficam em routers_file, secao [agent]).
 [mikrotik]
+; nome exibido no log e no painel
+name = principal
 host = 192.168.88.1
 ; 8728 = api   |   8729 = api-ssl (use_ssl = yes)
 port = 8728
@@ -46,3 +50,16 @@ log_level = INFO
 log_max_bytes = 10485760
 log_backups = 5
 lockfile = /run/f2b-mikrotik.lock
+; roteadores adicionais cadastrados pelo painel (relido sozinho quando muda)
+routers_file = /etc/f2b-mikrotik/routers.json
+
+[web]
+; painel web (f2b_web.py). Use 127.0.0.1 para aceitar so acessos locais.
+bind = 0.0.0.0
+port = 8088
+username = admin
+; obrigatoria: o painel nao inicia sem senha
+password =
+; HTTPS opcional (recomendado fora da rede interna): caminhos do certificado e da chave
+tls_cert =
+tls_key =

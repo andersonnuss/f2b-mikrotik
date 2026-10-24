@@ -14,6 +14,9 @@ Funcionamento
   * Se o fail2ban nao responder, nada e removido do roteador (fail-safe).
   * Blacklist: arquivo texto com um IP ou rede por linha, bloqueados independentemente do
     fail2ban. O arquivo e relido sozinho quando alterado; apagar a linha libera no roteador.
+  * Varios roteadores: o principal vem do config.ini e os demais do routers.json (editado
+    pela interface web, f2b_web.py). Todos recebem os mesmos bloqueios; a falha de um nao
+    atrapalha os outros.
 
 Fala com o roteador pela API do RouterOS (porta 8728, ou 8729 com SSL), implementada
 aqui mesmo: nenhuma dependencia externa, apenas Python 3.6+.
@@ -31,6 +34,7 @@ import binascii
 import configparser
 import hashlib
 import ipaddress
+import json
 import logging
 import logging.handlers
 import os
@@ -43,7 +47,7 @@ import subprocess
 import sys
 import time
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 log = logging.getLogger("f2b-mikrotik")
 
@@ -238,10 +242,14 @@ class Fail2ban:
             per_jail[jail] = m.group(1).split() if m else []
         return per_jail
 
-    def banned(self):
-        """Retorna {ip: set(jails)} com tudo que esta banido agora."""
+    def per_jail(self):
+        """{jail: [ips]} de todas as jails, como o fail2ban informa."""
+        return self._per_jail()
+
+    def banned(self, per_jail=None):
+        """Retorna {ip: set(jails)} com tudo que esta banido agora (nas jails configuradas)."""
         result = {}
-        for jail, ips in self._per_jail().items():
+        for jail, ips in (self._per_jail() if per_jail is None else per_jail).items():
             if self.jails and jail not in self.jails:
                 continue
             for ip in ips:
@@ -344,12 +352,63 @@ def parse_list(value):
     return [v.strip() for v in re.split(r"[,\s]+", value or "") if v.strip()]
 
 
+class RoutersFileError(Exception):
+    pass
+
+
+PRIMARY_ID = "principal"
+ROUTER_FIELDS = ("id", "name", "host", "port", "username", "password", "use_ssl", "timeout", "enabled")
+
+
+def file_signature(path):
+    try:
+        st = os.stat(path)
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def read_routers_file(path):
+    """Roteadores adicionais (cadastrados pela interface web). Arquivo ausente = nenhum."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError) as e:
+        raise RoutersFileError("nao foi possivel ler %s: %s" % (path, e))
+    if not isinstance(data, dict) or not isinstance(data.get("routers", []), list):
+        raise RoutersFileError("formato invalido em %s" % path)
+    routers = []
+    for r in data.get("routers", []):
+        try:
+            routers.append(dict(id=str(r["id"]), name=str(r.get("name") or r["host"]), host=str(r["host"]),
+                                port=int(r.get("port", 8728)), username=str(r["username"]),
+                                password=str(r.get("password", "")), use_ssl=bool(r.get("use_ssl", False)),
+                                timeout=float(r.get("timeout", 10)), enabled=bool(r.get("enabled", True)),
+                                primary=False))
+        except (KeyError, TypeError, ValueError, AttributeError):
+            raise RoutersFileError("roteador invalido em %s: %r" % (path, r))
+    return routers
+
+
+def write_routers_file(path, routers):
+    """Grava os roteadores adicionais de forma atomica e com permissao 600 (contem senhas)."""
+    data = {"routers": [{k: r[k] for k in ROUTER_FIELDS} for r in routers if not r.get("primary")]}
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
 class Agent:
     def __init__(self, cfg, dry_run=False):
         mk, f2b, ag = cfg["mikrotik"], cfg["fail2ban"], cfg["agent"]
-        self.router = dict(host=mk.get("host"), port=mk.getint("port"), username=mk.get("username"),
-                           password=mk.get("password"), use_ssl=mk.getboolean("use_ssl"),
-                           timeout=mk.getfloat("timeout"))
+        self.primary = dict(id=PRIMARY_ID, name=mk.get("name").strip() or PRIMARY_ID, host=mk.get("host"),
+                            port=mk.getint("port"), username=mk.get("username"), password=mk.get("password"),
+                            use_ssl=mk.getboolean("use_ssl"), timeout=mk.getfloat("timeout"),
+                            enabled=True, primary=True)
         self.list_name = mk.get("address_list")
         self.prefix = mk.get("comment_prefix")
         self.entry_timeout = mk.get("entry_timeout").strip()
@@ -358,18 +417,56 @@ class Agent:
         self.f2b_log = f2b.get("logfile").strip()
         self.whitelist = [ipaddress.ip_network(n, strict=False) for n in parse_list(f2b.get("whitelist"))]
         self.blacklist_file = cfg["blacklist"].get("file").strip()
+        self.routers_file = ag.get("routers_file").strip()
         self.sync_interval = ag.getfloat("sync_interval")
         self.debounce = ag.getfloat("debounce")
         self.retry_delay = ag.getfloat("retry_delay")
         self.dry_run = dry_run
+        self.routers = [self.primary]
+        self._routers_sig = None
+        self._routers_loaded = False
         self._ignored_logged = set()
-        self._last_error = (None, 0.0)
+        self._errors = {}
         self._stop = False
+        self.reload_routers()
+
+    # -- roteadores ---------------------------------------------------------------
+    def reload_routers(self):
+        """Rele o routers.json se ele mudou. Retorna True se a lista mudou.
+        Se o arquivo estiver invalido, mantem a lista anterior."""
+        if not self.routers_file:
+            return False
+        sig = file_signature(self.routers_file)
+        if sig == self._routers_sig:
+            return False
+        self._routers_sig = sig
+        try:
+            extra = read_routers_file(self.routers_file)
+        except RoutersFileError as e:
+            log.error("%s; mantendo a lista anterior de roteadores", e)
+            return False
+        routers, ids = [self.primary], {PRIMARY_ID}
+        for r in extra:
+            if r["id"] in ids:
+                log.warning("roteador com id repetido em %s ignorado: %s", self.routers_file, r["id"])
+                continue
+            ids.add(r["id"])
+            routers.append(r)
+        self.routers = routers
+        if self._routers_loaded:
+            log.info("lista de roteadores atualizada: %s", self.describe_routers())
+        self._routers_loaded = True
+        return True
+
+    def describe_routers(self):
+        return ", ".join("%s (%s:%s%s)" % (r["name"], r["host"], r["port"], "" if r["enabled"] else ", desabilitado")
+                         for r in self.routers)
+
+    def api(self, router):
+        return RouterOSApi(host=router["host"], port=router["port"], username=router["username"],
+                           password=router["password"], use_ssl=router["use_ssl"], timeout=router["timeout"])
 
     # -- auxiliares -------------------------------------------------------------
-    def _api(self):
-        return RouterOSApi(**self.router)
-
     def _whitelisted(self, entry):
         for net in self.whitelist:
             if entry.version == net.version and (entry.overlaps(net) if is_network(entry) else entry in net):
@@ -403,13 +500,6 @@ class Agent:
                 result[str(entry)] = (entry, {BLACKLIST_TAG})
         return result
 
-    def _blacklist_signature(self):
-        try:
-            st = os.stat(self.blacklist_file)
-            return (st.st_mtime_ns, st.st_size)
-        except OSError:
-            return None
-
     @staticmethod
     def _merge(banned, blacklist):
         desired = {k: (entry, set(tags)) for k, (entry, tags) in blacklist.items()}
@@ -422,7 +512,7 @@ class Agent:
         return desired
 
     def _desired(self):
-        """O que deve estar bloqueado no roteador: ({chave: (ip_ou_rede, origens)}, fail2ban_ok).
+        """O que deve estar bloqueado nos roteadores: ({chave: (ip_ou_rede, origens)}, fail2ban_ok).
 
         Se o fail2ban estiver fora do ar, aplica so a blacklist e sinaliza para nada ser removido."""
         blacklist = self._blacklist()
@@ -431,14 +521,15 @@ class Agent:
         except Fail2banError as e:
             if not blacklist:
                 raise
-            self._report_error("fail2ban indisponivel; aplicando apenas a blacklist, nada sera removido: %s" % e)
+            self._report_error("fontes", "fail2ban indisponivel; aplicando apenas a blacklist, "
+                                         "nada sera removido: %s" % e)
             return blacklist, False
         return self._merge(banned, blacklist), True
 
-    def _from_fail2ban(self):
+    def _from_fail2ban(self, per_jail=None):
         """IPs banidos no fail2ban: {ip_str: (ip, jails)}."""
         desired = {}
-        for raw, jails in self.f2b.banned().items():
+        for raw, jails in self.f2b.banned(per_jail).items():
             ip = normalize_ip(raw)
             if ip is None or not isinstance(ip, (ipaddress.IPv4Address, ipaddress.IPv6Address)):
                 self._log_ignored(raw, "endereco invalido")
@@ -457,30 +548,57 @@ class Agent:
             log.warning("IGNORADO %s (%s) - nao sera bloqueado no MikroTik", ip, why)
             self._ignored_logged.add(ip)
 
+    def router_rows(self, api):
+        """Todas as entradas da address-list no roteador."""
+        rows = []
+        for fam in self.families:
+            res, _ = api.talk([LIST_PATHS[fam] + "/print", "=.proplist=.id,address,comment,timeout,disabled",
+                               "?list=" + self.list_name])
+            for r in res:
+                addr = r.get("address", "")
+                ip = normalize_ip(addr)
+                comment = r.get("comment", "")
+                rows.append(dict(key=str(ip) if ip is not None else addr, entry=ip, family=fam, id=r.get(".id"),
+                                 comment=comment, managed=comment.startswith(self.prefix),
+                                 timeout=r.get("timeout", ""), disabled=r.get("disabled") == "true"))
+        return rows
+
     def _router_entries(self, api):
         """Retorna (gerenciadas {ip_str: (familia, .id, comentario)}, demais enderecos da lista)."""
         managed, others = {}, set()
-        for fam in self.families:
-            rows, _ = api.talk([LIST_PATHS[fam] + "/print", "=.proplist=.id,address,comment",
-                                "?list=" + self.list_name])
-            for r in rows:
-                addr = r.get("address", "")
-                ip = normalize_ip(addr)
-                key = str(ip) if ip is not None else addr
-                comment = r.get("comment", "")
-                if comment.startswith(self.prefix):
-                    managed[key] = (fam, r.get(".id"), comment)
-                else:
-                    others.add(key)
+        for r in self.router_rows(api):
+            if r["managed"]:
+                managed[r["key"]] = (r["family"], r["id"], r["comment"])
+            else:
+                others.add(r["key"])
         return managed, others
 
     # -- operacoes ----------------------------------------------------------------
     def sync(self, reason="periodica"):
-        """Reconciliacao completa. Retorna True se nao houve erros."""
-        # se fail2ban e blacklist falharem, levanta excecao antes de tocar no roteador
+        """Reconciliacao completa com todos os roteadores. Retorna True se nao houve erros."""
+        # se fail2ban e blacklist falharem, levanta excecao antes de tocar nos roteadores
         desired, f2b_ok = self._desired()
+        if f2b_ok:
+            self._clear_error("fontes", "fail2ban respondendo novamente")
+        self.reload_routers()
+        ok = f2b_ok
+        for router in self.routers:
+            if not router["enabled"]:
+                continue
+            try:
+                errors = self._sync_router(router, desired, f2b_ok, reason)
+                self._clear_error(router["id"], "comunicacao com o MikroTik [%s] restabelecida" % router["name"])
+                ok = ok and errors == 0
+            except (RouterOSError, OSError) as e:
+                ok = False
+                self._report_error(router["id"], "falha ao comunicar com o MikroTik [%s] %s:%s: %s"
+                                   % (router["name"], router["host"], router["port"], e))
+        return ok
+
+    def _sync_router(self, router, desired, f2b_ok, reason):
+        name = router["name"]
         added = removed = errors = 0
-        with self._api() as api:
+        with self.api(router) as api:
             managed, others = self._router_entries(api)
             to_add = sorted(k for k in desired if k not in managed and k not in others)
             to_remove = sorted(k for k in managed if k not in desired) if f2b_ok else []
@@ -494,45 +612,52 @@ class Agent:
                 if self.entry_timeout:
                     words.append("=timeout=" + self.entry_timeout)
                 if self.dry_run:
-                    log.info("[dry-run] BLOQUEARIA no MikroTik: %s (jail: %s)", key, jail_txt)
+                    log.info("[dry-run] BLOQUEARIA no MikroTik [%s]: %s (jail: %s)", name, key, jail_txt)
                     continue
                 try:
                     api.talk(words)
                     added += 1
-                    log.info("BLOQUEADO no MikroTik: %s (jail: %s)", key, jail_txt)
+                    log.info("BLOQUEADO no MikroTik [%s]: %s (jail: %s)", name, key, jail_txt)
                 except RouterOSTrap as e:
                     errors += 1
-                    log.error("erro ao bloquear %s no MikroTik: %s", key, e)
+                    log.error("erro ao bloquear %s no MikroTik [%s]: %s", key, name, e)
 
             for key in to_remove:
                 fam, rid, comment = managed[key]
                 if self.dry_run:
-                    log.info("[dry-run] LIBERARIA no MikroTik: %s", key)
+                    log.info("[dry-run] LIBERARIA no MikroTik [%s]: %s", name, key)
                     continue
                 try:
                     api.talk([LIST_PATHS[fam] + "/remove", "=.id=" + rid])
                     removed += 1
-                    log.info("LIBERADO no MikroTik: %s (%s)", key, comment)
+                    log.info("LIBERADO no MikroTik [%s]: %s (%s)", name, key, comment)
                 except RouterOSTrap as e:
                     errors += 1
-                    log.error("erro ao liberar %s no MikroTik: %s", key, e)
+                    log.error("erro ao liberar %s no MikroTik [%s]: %s", key, name, e)
 
         level = logging.INFO if (to_add or to_remove or errors) else logging.DEBUG
-        log.log(level, "sincronizacao %s: %d a bloquear (fail2ban + blacklist), %d no roteador | +%d -%d, %d erro(s)",
-                reason, len(desired), len(managed) + added - removed, added, removed, errors)
-        return errors == 0 and f2b_ok
+        log.log(level, "sincronizacao %s [%s]: %d a bloquear (fail2ban + blacklist), %d no roteador | "
+                       "+%d -%d, %d erro(s)", reason, name, len(desired), len(managed) + added - removed,
+                added, removed, errors)
+        return errors
 
     def flush(self):
-        with self._api() as api:
-            managed, _ = self._router_entries(api)
-            for key, (fam, rid, _comment) in sorted(managed.items()):
-                if self.dry_run:
-                    log.info("[dry-run] REMOVERIA do MikroTik: %s", key)
-                    continue
-                api.talk([LIST_PATHS[fam] + "/remove", "=.id=" + rid])
-                log.info("REMOVIDO do MikroTik: %s", key)
-        log.info("flush concluido: %d entrada(s) do agente %s", len(managed),
-                 "seriam removidas" if self.dry_run else "removidas")
+        for router in self.routers:
+            if not router["enabled"]:
+                continue
+            try:
+                with self.api(router) as api:
+                    managed, _ = self._router_entries(api)
+                    for key, (fam, rid, _comment) in sorted(managed.items()):
+                        if self.dry_run:
+                            log.info("[dry-run] REMOVERIA do MikroTik [%s]: %s", router["name"], key)
+                            continue
+                        api.talk([LIST_PATHS[fam] + "/remove", "=.id=" + rid])
+                        log.info("REMOVIDO do MikroTik [%s]: %s", router["name"], key)
+                log.info("flush [%s] concluido: %d entrada(s) do agente %s", router["name"], len(managed),
+                         "seriam removidas" if self.dry_run else "removidas")
+            except (RouterOSError, OSError) as e:
+                log.error("flush [%s] falhou: %s", router["name"], e)
 
     def test(self):
         ok = True
@@ -558,48 +683,50 @@ class Agent:
         except Fail2banError as e:
             print("FALHOU: %s" % e)
             ok = False
-        print("MikroTik %s:%s ..." % (self.router["host"], self.router["port"]), end=" ", flush=True)
-        try:
-            with self._api() as api:
-                res, _ = api.talk(["/system/resource/print"])
-                info = res[0] if res else {}
-                managed, others = self._router_entries(api)
-            print("OK - %s RouterOS %s" % (info.get("board-name", "?"), info.get("version", "?")))
-            print("  lista '%s': %d entrada(s) do agente, %d outra(s)" % (self.list_name, len(managed), len(others)))
-            if desired is not None:
-                print("  a adicionar: %d   a remover: %d" % (
-                    len([k for k in desired if k not in managed and k not in others]),
-                    len([k for k in managed if k not in desired])))
-        except (RouterOSError, OSError) as e:
-            print("FALHOU: %s" % e)
-            ok = False
+        for router in self.routers:
+            print("MikroTik [%s] %s:%s ..." % (router["name"], router["host"], router["port"]), end=" ", flush=True)
+            if not router["enabled"]:
+                print("desabilitado")
+                continue
+            try:
+                with self.api(router) as api:
+                    res, _ = api.talk(["/system/resource/print"])
+                    info = res[0] if res else {}
+                    managed, others = self._router_entries(api)
+                print("OK - %s RouterOS %s" % (info.get("board-name", "?"), info.get("version", "?")))
+                print("  lista '%s': %d entrada(s) do agente, %d outra(s)"
+                      % (self.list_name, len(managed), len(others)))
+                if desired is not None:
+                    print("  a adicionar: %d   a remover: %d" % (
+                        len([k for k in desired if k not in managed and k not in others]),
+                        len([k for k in managed if k not in desired])))
+            except (RouterOSError, OSError) as e:
+                print("FALHOU: %s" % e)
+                ok = False
         return ok
 
     def safe_sync(self, reason):
         try:
-            ok = self.sync(reason)
-            if ok and self._last_error[0] is not None:
-                log.info("comunicacao restabelecida")
-                self._last_error = (None, 0.0)
-            return ok
+            return self.sync(reason)
         except Fail2banError as e:
-            self._report_error("fail2ban indisponivel, nada foi alterado no roteador: %s" % e)
+            self._report_error("fontes", "fail2ban indisponivel, nada foi alterado nos roteadores: %s" % e)
         except BlacklistError as e:
-            self._report_error("%s; nada foi alterado no roteador" % e)
-        except (RouterOSError, OSError) as e:
-            self._report_error("falha ao comunicar com o MikroTik %s:%s: %s"
-                               % (self.router["host"], self.router["port"], e))
+            self._report_error("fontes", "%s; nada foi alterado nos roteadores" % e)
         except Exception:
             log.exception("erro inesperado na sincronizacao")
         return False
 
-    def _report_error(self, msg):
+    def _report_error(self, key, msg):
         # evita encher o log com o mesmo erro a cada tentativa: repete no maximo a cada 5 min
-        last_msg, last_time = self._last_error
+        last_msg, last_time = self._errors.get(key, (None, 0.0))
         now = time.monotonic()
         if msg != last_msg or now - last_time >= 300:
             log.error("%s (nova tentativa em %ds)", msg, self.retry_delay)
-            self._last_error = (msg, now)
+            self._errors[key] = (msg, now)
+
+    def _clear_error(self, key, msg):
+        if self._errors.pop(key, None) is not None:
+            log.info(msg)
 
     def run_forever(self):
         def on_signal(signum, _frame):
@@ -610,7 +737,7 @@ class Agent:
         signal.signal(signal.SIGINT, on_signal)
 
         watcher = LogWatcher(self.f2b_log) if self.f2b_log else None
-        bl_sig = self._blacklist_signature() if self.blacklist_file else None
+        bl_sig = file_signature(self.blacklist_file) if self.blacklist_file else None
         next_sync = 0.0
         pending_since = last_event = None
 
@@ -622,10 +749,12 @@ class Agent:
                     log.info("fail2ban: [%s] %s %s", jail, action, ip)
                     changed = True
             if self.blacklist_file:
-                sig = self._blacklist_signature()
+                sig = file_signature(self.blacklist_file)
                 if sig != bl_sig:
                     log.info("blacklist %s alterada", self.blacklist_file)
                     bl_sig, changed = sig, True
+            if self.reload_routers():
+                changed = True
             if changed:
                 last_event = now
                 if pending_since is None:
@@ -647,14 +776,17 @@ class Agent:
 # Configuracao, log e entrada
 # --------------------------------------------------------------------------- #
 DEFAULTS = {
-    "mikrotik": {"port": "8728", "use_ssl": "no", "timeout": "10", "address_list": "fail2ban",
+    "mikrotik": {"name": PRIMARY_ID, "port": "8728", "use_ssl": "no", "timeout": "10", "address_list": "fail2ban",
                  "comment_prefix": "f2b-agent", "entry_timeout": "", "ipv6": "no"},
     "fail2ban": {"client": "/usr/bin/fail2ban-client", "logfile": "/var/log/fail2ban.log", "jails": "",
                  "whitelist": "127.0.0.0/8, ::1"},
     "blacklist": {"file": "/etc/f2b-mikrotik/blacklist.txt"},
     "agent": {"sync_interval": "60", "debounce": "2", "retry_delay": "15",
               "logfile": "/var/log/f2b-mikrotik.log", "log_level": "INFO",
-              "log_max_bytes": "10485760", "log_backups": "5", "lockfile": "/run/f2b-mikrotik.lock"},
+              "log_max_bytes": "10485760", "log_backups": "5", "lockfile": "/run/f2b-mikrotik.lock",
+              "routers_file": "/etc/f2b-mikrotik/routers.json"},
+    "web": {"bind": "0.0.0.0", "port": "8088", "username": "admin", "password": "",
+            "tls_cert": "", "tls_key": ""},
 }
 
 
@@ -727,9 +859,9 @@ def main():
     elif args.once:
         sys.exit(0 if agent.safe_sync("cron") else 1)
     else:
-        log.info("f2b-mikrotik %s iniciado: roteador=%s:%s lista=%s jails=%s%s", __version__,
-                 agent.router["host"], agent.router["port"], agent.list_name,
+        log.info("f2b-mikrotik %s iniciado: lista=%s jails=%s%s", __version__, agent.list_name,
                  ",".join(sorted(agent.f2b.jails)) or "todas", " [DRY-RUN]" if agent.dry_run else "")
+        log.info("roteadores: %s", agent.describe_routers())
         agent.run_forever()
 
 
