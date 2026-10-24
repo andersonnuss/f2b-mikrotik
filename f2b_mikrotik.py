@@ -47,7 +47,7 @@ import subprocess
 import sys
 import time
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 log = logging.getLogger("f2b-mikrotik")
 
@@ -246,6 +246,10 @@ class Fail2ban:
         """{jail: [ips]} de todas as jails, como o fail2ban informa."""
         return self._per_jail()
 
+    def unban(self, ip, jail):
+        """Libera um IP de uma jail (funciona em todas as versoes do fail2ban)."""
+        self._run("set", jail, "unbanip", ip)
+
     def banned(self, per_jail=None):
         """Retorna {ip: set(jails)} com tudo que esta banido agora (nas jails configuradas)."""
         result = {}
@@ -346,6 +350,13 @@ def normalize_ip(text):
     except ValueError:
         return None
     return net.network_address if net.num_addresses == 1 else net
+
+
+def parse_blacklist_line(line):
+    """'198.51.100.0/24   # scanner' -> ('198.51.100.0/24', 'scanner'); linha vazia/comentario -> ('', ...)."""
+    text, _, comment = line.partition("#")
+    tokens = text.split()
+    return (tokens[0] if tokens else ""), comment.strip()
 
 
 def parse_list(value):
@@ -486,10 +497,10 @@ class Agent:
         except OSError as e:
             raise BlacklistError("nao foi possivel ler a blacklist %s: %s" % (self.blacklist_file, e))
         for n, line in enumerate(lines, 1):
-            text = line.split("#", 1)[0].strip()
+            text, _comment = parse_blacklist_line(line)
             if not text:
                 continue
-            entry = normalize_ip(text.split()[0])
+            entry = normalize_ip(text)
             if entry is None:
                 self._log_ignored(text, "linha %d da blacklist invalida" % n)
             elif self._whitelisted(entry):

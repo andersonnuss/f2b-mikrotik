@@ -127,19 +127,24 @@ function renderOverview() {
   const f = o.fail2ban;
   $("#f2b-box").innerHTML = !f.ok
     ? `<div class="alert">${esc(f.error)}</div>`
-    : (f.jails.length ? f.jails.map((j) => `
-        <div class="jail">
-          <div class="jail-head"><strong>${esc(j.name)}</strong>
-            <span class="count">${j.ips.length}</span>
-            ${j.replicated ? "" : '<span class="pill warn">não replicada</span>'}</div>
-          ${j.ips.length ? `<div class="chips">${j.ips.map(chip).join("")}</div>` : '<span class="muted small">nenhum IP banido</span>'}
-        </div>`).join("") : '<span class="muted">nenhuma jail ativa</span>');
+    : (f.jails.length ? `<div class="jail-list">${f.jails.map((j) => `
+        <div class="jail-head"><strong>${esc(j.name)}</strong>
+          <span class="count">${j.ips.length} banido(s)</span>
+          ${j.replicated ? "" : '<span class="pill warn">não replicada</span>'}</div>`).join("")}</div>`
+      : '<span class="muted">nenhuma jail ativa</span>');
 
   const b = o.blacklist;
-  $("#bl-box").innerHTML = !b.file ? '<span class="muted">desativada no config.ini</span>'
+  $("#bl-form").hidden = !b.file;
+  $("#bl-box").innerHTML = !b.file ? '<span class="muted">desativada no config.ini ([blacklist] file)</span>'
     : !b.ok ? `<div class="alert">${esc(b.error)}</div>`
-      : `<div class="muted small mono">${esc(b.file)}</div>
-         ${b.entries.length ? `<div class="chips mt">${b.entries.map(chip).join("")}</div>` : '<p class="muted small">vazia</p>'}`;
+      : (b.items.length ? `<div class="bl-list">${b.items.map((it) => `
+          <div class="bl-item">
+            <button type="button" class="link mono" data-check="${esc(it.entry)}">${esc(it.entry)}</button>
+            <span class="muted small bl-comment">${esc(it.comment)}</span>
+            ${it.ignored ? `<span class="pill warn" title="o agente ignora esta linha">ignorado: ${esc(it.ignored)}</span>` : ""}
+            <button type="button" class="btn small" data-act="bl-del" data-entry="${esc(it.entry)}" title="remover da blacklist">Remover</button>
+          </div>`).join("")}</div>` : '<p class="muted small">vazia</p>')
+        + `<div class="muted small mono mt">${esc(b.file)}</div>`;
   $("#wl-box").innerHTML = o.whitelist.length
     ? `<div class="chips">${o.whitelist.map(chip).join("")}</div>` : '<span class="muted">vazia</span>';
 }
@@ -166,9 +171,8 @@ function renderEntries() {
   const onlyDiff = $("#entries-diff").checked;
 
   const rows = overview.entries.filter((e) => {
-    const isF2b = e.sources.some((s) => s !== "blacklist");
-    if (source === "fail2ban" && !isF2b) return false;
-    if (source === "blacklist" && !e.sources.includes("blacklist")) return false;
+    if (source === "fail2ban" && !e.jails.length) return false;
+    if (source === "blacklist" && !e.blacklist) return false;
     if (source === "router" && e.sources.length) return false;
     if (onlyDiff && !Object.values(e.routers).some((s) => s === "faltando" || s === "a remover")) return false;
     if (filter && !(e.key.toLowerCase().includes(filter) || e.sources.join(" ").toLowerCase().includes(filter))) return false;
@@ -177,15 +181,109 @@ function renderEntries() {
 
   $("#count-entries").textContent = overview.entries.length;
   $("#entries-info").textContent = `${rows.length} de ${overview.entries.length}`;
-  const head = `<thead><tr><th>IP / rede</th><th>origem</th>${routers.map((r) => `<th class="center">${esc(r.name)}</th>`).join("")}</tr></thead>`;
+  const head = `<thead><tr><th>IP / rede</th><th>fail2ban</th><th>blacklist</th>
+    ${routers.map((r) => `<th class="center">${esc(r.name)}</th>`).join("")}<th></th></tr></thead>`;
   const body = rows.length ? rows.slice(0, 3000).map((e) => `<tr>
-      <td><button type="button" class="link mono" data-check="${esc(e.key)}">${esc(e.key)}</button></td>
-      <td>${e.sources.length ? e.sources.map((s) => `<span class="pill ${s === "blacklist" ? "info" : ""}">${esc(s)}</span>`).join(" ") : '<span class="muted small">só no roteador</span>'}</td>
+      <td><button type="button" class="link mono" data-check="${esc(e.key)}">${esc(e.key)}</button>
+        ${e.note ? `<div class="muted small">${esc(e.note)}</div>` : ""}
+        ${!e.sources.length ? '<div class="muted small">só no roteador</div>' : ""}</td>
+      <td>${e.jails.map((j) => `<span class="pill">${esc(j)}</span>`).join(" ")}</td>
+      <td>${e.blacklist ? '<span class="pill info">sim</span>' : ""}</td>
       ${routers.map((r) => `<td class="center">${stateBadge(e.routers[r.id])}</td>`).join("")}
+      <td><div class="actions">${rowActions(e)}</div></td>
     </tr>`).join("")
-    : `<tr><td colspan="${routers.length + 2}" class="empty">nada encontrado</td></tr>`;
+    : `<tr><td colspan="${routers.length + 4}" class="empty">nada encontrado</td></tr>`;
   $("#entries-table").innerHTML = head + `<tbody>${body}</tbody>`;
 }
+
+function rowActions(e) {
+  const out = [];
+  if (e.jails.length) out.push(`<button type="button" class="btn small" data-act="unban" data-ip="${esc(e.key)}">Desbanir</button>`);
+  if (e.blacklist) out.push(`<button type="button" class="btn small" data-act="bl-del" data-entry="${esc(e.key)}">Tirar da blacklist</button>`);
+  else if (!e.whitelisted) out.push(`<button type="button" class="btn small" data-act="bl-add" data-entry="${esc(e.key)}">+ Blacklist</button>`);
+  return out.join("");
+}
+
+// ---------------------------------------------------------------------------
+// acoes: desbanir e blacklist
+// ---------------------------------------------------------------------------
+let toastTimer = null;
+function toast(msg, kind = "ok") {
+  const el = $("#toast");
+  el.textContent = msg;
+  el.className = `toast show ${kind}`;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.className = "toast"; }, 6000);
+}
+
+// o agente replica em ~2 s: recarrega ja (blacklist/fail2ban) e de novo depois (roteadores)
+function refreshSoon() {
+  loadOverview();
+  setTimeout(() => {
+    loadOverview();
+    if ($("#check-result").innerHTML.trim()) runCheck();
+  }, 3500);
+}
+
+async function doUnban(ip) {
+  const e = overview && overview.entries.find((x) => x.key === ip);
+  let msg = `Desbanir ${ip} no fail2ban${e && e.jails.length ? ` (jail: ${e.jails.join(", ")})` : ""}?\n\n`
+    + "O agente libera o IP nos MikroTiks em cerca de 2 segundos.";
+  if (e && e.blacklist) msg += `\n\nAtenção: ${ip} também está na blacklist e continuará bloqueado nos roteadores.`;
+  if (!confirm(msg)) return;
+  const r = await api("/api/unban", { method: "POST", body: { ip } });
+  toast(r.in_blacklist
+    ? `${r.ip} desbanido de ${r.jails.join(", ")}, mas continua bloqueado pela blacklist.`
+    : `${r.ip} desbanido de ${r.jails.join(", ")}. O agente está liberando nos MikroTiks…`, r.in_blacklist ? "warn" : "ok");
+  refreshSoon();
+}
+
+async function doBlacklistAdd(entry, comment) {
+  if (comment === undefined) {
+    comment = prompt(`Incluir ${entry} na blacklist?\nEle será bloqueado em todos os MikroTiks.\n\nMotivo (opcional):`, "");
+    if (comment === null) return;
+  }
+  const r = await api("/api/blacklist", { method: "POST", body: { entry, comment } });
+  toast(`${r.entry} incluído na blacklist. O agente está bloqueando nos MikroTiks…`);
+  refreshSoon();
+  return r;
+}
+
+async function doBlacklistRemove(entry) {
+  const e = overview && overview.entries.find((x) => x.key === entry);
+  let msg = `Remover ${entry} da blacklist?\n\nO agente libera nos MikroTiks em cerca de 2 segundos.`;
+  if (e && e.jails.length) msg += `\n\nAtenção: ${entry} também está banido no fail2ban (${e.jails.join(", ")}) e continuará bloqueado até o ban expirar ou ser desfeito.`;
+  if (!confirm(msg)) return;
+  const r = await api("/api/blacklist", { method: "DELETE", body: { entry } });
+  toast(`${r.entry} removido da blacklist.`);
+  refreshSoon();
+}
+
+document.addEventListener("click", async (ev) => {
+  const btn = ev.target.closest("[data-act]");
+  if (!btn || !["unban", "bl-add", "bl-del"].includes(btn.dataset.act)) return;
+  btn.disabled = true;
+  try {
+    if (btn.dataset.act === "unban") await doUnban(btn.dataset.ip);
+    if (btn.dataset.act === "bl-add") await doBlacklistAdd(btn.dataset.entry);
+    if (btn.dataset.act === "bl-del") await doBlacklistRemove(btn.dataset.entry);
+  } catch (e) {
+    toast(e.message, "bad");
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+$("#bl-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const fe = ev.target.elements;
+  try {
+    await doBlacklistAdd(fe.namedItem("entry").value.trim(), fe.namedItem("comment").value.trim());
+    ev.target.reset();
+  } catch (e) {
+    toast(e.message, "bad");
+  }
+});
 ["#entries-filter", "#entries-source", "#entries-diff"].forEach((s) => $(s).addEventListener("input", renderEntries));
 
 // ---------------------------------------------------------------------------
@@ -251,10 +349,23 @@ function renderCheck(c) {
     return `<tr><td><strong>${esc(r.name)}</strong><div class="muted small mono">${esc(r.host)}</div></td><td>${statusPill(r.status)}</td><td>${result}</td></tr>`;
   }).join("");
 
+  const actions = [];
+  if (c.fail2ban.matches.some((m) => m.relation === "igual")) {
+    actions.push(`<button type="button" class="btn" data-act="unban" data-ip="${esc(c.query)}">Desbanir no fail2ban</button>`);
+  }
+  const blExact = c.blacklist.matches.filter((m) => m.relation === "igual");
+  c.blacklist.matches.forEach((m) => {
+    actions.push(`<button type="button" class="btn" data-act="bl-del" data-entry="${esc(m.entry)}">Tirar ${esc(m.entry)} da blacklist</button>`);
+  });
+  if (!blExact.length && !c.whitelist.length && c.blacklist.ok) {
+    actions.push(`<button type="button" class="btn" data-act="bl-add" data-entry="${esc(c.query)}">Incluir na blacklist</button>`);
+  }
+
   $("#check-result").innerHTML = `
     <div class="verdict ${cls}">
       <div class="verdict-title">${title}</div>
       <ul>${facts.map((f) => `<li>${f}</li>`).join("")}</ul>
+      ${actions.length ? `<div class="verdict-actions">${actions.join("")}</div>` : ""}
       <div class="table-wrap"><table class="table"><thead><tr><th>roteador</th><th>status</th><th>resultado</th></tr></thead><tbody>${rows}</tbody></table></div>
     </div>`;
 }

@@ -5,8 +5,9 @@ f2b-mikrotik web - painel para consultar o que esta bloqueado (fail2ban, blackli
 MikroTik) e cadastrar os roteadores adicionais que recebem os mesmos bloqueios.
 
 Usa o proprio f2b_mikrotik.py para falar com o fail2ban e com os roteadores; nao tem
-dependencias externas (Python 3.7+). O painel so le: quem bloqueia e libera e o agente.
-Os roteadores cadastrados aqui vao para o routers.json, que o agente rele sozinho.
+dependencias externas (Python 3.7+). Bloquear e liberar nos roteadores e trabalho do agente:
+o painel desbane no fail2ban e edita a blacklist e o routers.json, e o agente replica em ~2 s.
+(A unica escrita direta num roteador e a limpeza opcional ao exclui-lo do cadastro.)
 
     python3 f2b_web.py -c /etc/f2b-mikrotik/config.ini [--port 8088]
 """
@@ -102,14 +103,46 @@ class Panel:
         except core.Fail2banError as e:
             f2b.update(ok=False, error=str(e))
             per_jail, banned = {}, {}
-        bl = {"ok": True, "error": None, "file": a.blacklist_file, "entries": []}
+        bl = {"ok": True, "error": None, "file": a.blacklist_file, "entries": [], "items": []}
         try:
             blacklist = a._blacklist()
             bl["entries"] = sorted(blacklist, key=sort_key)
+            bl["items"] = self.blacklist_items()
         except core.BlacklistError as e:
             bl.update(ok=False, error=str(e))
             blacklist = {}
         return f2b, bl, per_jail, blacklist, a._merge(banned, blacklist)
+
+    def _skip_reason(self, entry):
+        """Por que o agente nao bloqueia esta entrada (ou None se bloqueia)."""
+        a = self.agent
+        if entry is None:
+            return "invalido"
+        if a._whitelisted(entry):
+            return "whitelist"
+        if entry.version not in a.families:
+            return "IPv6 desativado"
+        return None
+
+    def blacklist_items(self):
+        """Linhas validas da blacklist com o comentario de cada uma."""
+        path = self.agent.blacklist_file
+        if not path or not os.path.exists(path):
+            return []
+        try:
+            with open(path, encoding="utf-8") as fh:
+                lines = fh.readlines()
+        except OSError as e:
+            raise core.BlacklistError("nao foi possivel ler a blacklist %s: %s" % (path, e))
+        items = []
+        for n, line in enumerate(lines, 1):
+            token, comment = core.parse_blacklist_line(line)
+            if not token:
+                continue
+            entry = core.normalize_ip(token)
+            items.append({"entry": str(entry) if entry is not None else token, "comment": comment, "line": n,
+                          "ignored": self._skip_reason(entry)})
+        return items
 
     def _query_router(self, router):
         out = public_router(router)
@@ -138,14 +171,35 @@ class Panel:
         a = self.agent
         sources_future = self.pool.submit(self._sources)
         routers = self._query_routers()
-        f2b, bl, _per_jail, _blacklist, desired = sources_future.result()
+        f2b, bl, per_jail, blacklist, desired = sources_future.result()
 
-        keys = set(desired)
+        # tudo que esta banido no fail2ban (inclusive o que o agente nao replica), por IP
+        f2b_ips = {}
+        for jail, ips in per_jail.items():
+            for raw in ips:
+                ip = core.normalize_ip(raw)
+                f2b_ips.setdefault(str(ip) if ip is not None else raw, set()).add(jail)
+        bl_networks = [e for e, _ in blacklist.values() if core.is_network(e)]
+
+        keys = set(desired) | set(f2b_ips)
         for r in routers:
             keys.update(row["key"] for row in r["rows"])
         entries = []
         for key in sorted(keys, key=sort_key):
-            item = {"key": key, "sources": sorted(desired[key][1]) if key in desired else [], "routers": {}}
+            jails = sorted(f2b_ips.get(key, ()))
+            entry = core.normalize_ip(key)
+            item = {"key": key, "jails": jails, "blacklist": key in blacklist, "expected": key in desired,
+                    "sources": jails + (["blacklist"] if key in blacklist else []), "note": "",
+                    "whitelisted": entry is not None and a._whitelisted(entry), "routers": {}}
+            if jails and key not in desired:
+                cover = next((n for n in bl_networks if entry is not None and entry.version == n.version
+                              and entry in n), None)
+                if cover is not None:
+                    item["note"] = "coberto pela blacklist %s" % cover
+                elif self._skip_reason(entry):
+                    item["note"] = "não replicado: %s" % self._skip_reason(entry)
+                elif a.f2b.jails and not set(jails) & a.f2b.jails:
+                    item["note"] = "não replicado: jail fora da lista do agente"
             entries.append(item)
         index = {e["key"]: e for e in entries}
 
@@ -239,6 +293,111 @@ class Panel:
         except OSError as e:
             return {"file": self.agent_log, "lines": [], "error": str(e)}
         return {"file": self.agent_log, "lines": data[-lines:], "error": None}
+
+    # -- acoes: unban e blacklist ---------------------------------------------------
+    def unban(self, data, who):
+        try:
+            target = ipaddress.ip_address(str(data.get("ip", "")).strip())
+        except ValueError:
+            raise ApiError(400, "informe um IP valido")
+        jail_filter = data.get("jail") or None
+        f2b = self.agent.f2b
+        try:
+            per_jail = f2b.per_jail()
+        except core.Fail2banError as e:
+            raise ApiError(502, str(e))
+        done = []
+        for jail, ips in sorted(per_jail.items()):
+            if jail_filter and jail != jail_filter:
+                continue
+            for raw in ips:
+                if core.normalize_ip(raw) == target:
+                    try:
+                        f2b.unban(raw, jail)
+                    except core.Fail2banError as e:
+                        raise ApiError(502, "falha ao desbanir de %s: %s" % (jail, e))
+                    done.append(jail)
+        if not done:
+            raise ApiError(404, "%s nao esta banido %s" % (target, "na jail " + jail_filter if jail_filter
+                                                              else "no fail2ban"))
+        log.info("unban por %s: %s (jails: %s)", who, target, ", ".join(done))
+        try:
+            in_blacklist = any(relation(target, e) in ("igual", "dentro")
+                               for e, _ in self.agent._blacklist().values())
+        except core.BlacklistError:
+            in_blacklist = False
+        return {"ip": str(target), "jails": done, "in_blacklist": in_blacklist}
+
+    def _blacklist_path(self):
+        path = self.agent.blacklist_file
+        if not path:
+            raise ApiError(409, "a blacklist esta desativada no config.ini ([blacklist] file)")
+        return path
+
+    def _write_blacklist(self, path, lines):
+        mode = 0o644
+        try:
+            mode = os.stat(path).st_mode & 0o777
+        except OSError:
+            pass
+        tmp = path + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.writelines(lines)
+        os.replace(tmp, path)
+
+    def _read_blacklist(self, path):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return fh.readlines()
+        except FileNotFoundError:
+            return ["# Blacklist do f2b-mikrotik: um IP ou rede por linha\n"]
+        except OSError as e:
+            raise ApiError(500, "nao foi possivel ler %s: %s" % (path, e))
+
+    def blacklist_add(self, data, who):
+        entry = core.normalize_ip(str(data.get("entry", "")).strip())
+        if entry is None:
+            raise ApiError(400, "informe um IP ou rede valido (ex.: 203.0.113.5 ou 198.51.100.0/24)")
+        if core.is_network(entry) and entry.prefixlen < (8 if entry.version == 4 else 32):
+            raise ApiError(400, "rede grande demais (/%d): isso cortaria boa parte da internet" % entry.prefixlen)
+        reason = self._skip_reason(entry)
+        if reason == "whitelist":
+            nets = [str(n) for n in self.agent.whitelist if relation(entry, n)]
+            raise ApiError(400, "%s esta na whitelist (%s); o agente nao o bloquearia" % (entry, ", ".join(nets)))
+        if reason:
+            raise ApiError(400, "%s nao seria bloqueado: %s" % (entry, reason))
+        comment = re.sub(r"[\r\n#]+", " ", str(data.get("comment") or "")).strip()[:100]
+        stamp = time.strftime("%Y-%m-%d %H:%M")
+        note = "%s (%s, %s)" % (comment, who.split("@")[0], stamp) if comment else "%s, %s" % (who.split("@")[0], stamp)
+        path = self._blacklist_path()
+        with self.write_lock:
+            lines = self._read_blacklist(path)
+            for line in lines:
+                token, _ = core.parse_blacklist_line(line)
+                if token and str(core.normalize_ip(token)) == str(entry):
+                    raise ApiError(409, "%s ja esta na blacklist" % entry)
+            if lines and not lines[-1].endswith("\n"):
+                lines[-1] += "\n"
+            lines.append("%-24s # %s\n" % (entry, note))
+            self._write_blacklist(path, lines)
+        log.info("blacklist: %s incluido por %s", entry, who)
+        return {"entry": str(entry)}
+
+    def blacklist_remove(self, data, who):
+        entry = core.normalize_ip(str(data.get("entry", "")).strip())
+        if entry is None:
+            raise ApiError(400, "entrada invalida")
+        path = self._blacklist_path()
+        with self.write_lock:
+            lines = self._read_blacklist(path)
+            keep = [l for l in lines if str(core.normalize_ip(core.parse_blacklist_line(l)[0] or "-")) != str(entry)]
+            removed = len(lines) - len(keep)
+            if not removed:
+                raise ApiError(404, "%s nao esta na blacklist" % entry)
+            self._write_blacklist(path, keep)
+        log.info("blacklist: %s removido por %s", entry, who)
+        return {"entry": str(entry), "removed": removed}
 
     # -- cadastro de roteadores -----------------------------------------------------
     def _validate(self, data, current=None):
@@ -439,6 +598,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"routers": [public_router(r) for r in self.panel.routers()]})
             if method == "POST" and path == "/api/routers":
                 return self._json(201, self.panel.create_router(self._body(), self._who()))
+            if method == "POST" and path == "/api/unban":
+                return self._json(200, self.panel.unban(self._body(), self._who()))
+            if method == "POST" and path == "/api/blacklist":
+                return self._json(201, self.panel.blacklist_add(self._body(), self._who()))
+            if method == "DELETE" and path == "/api/blacklist":
+                return self._json(200, self.panel.blacklist_remove(self._body(), self._who()))
             if method == "POST" and path == "/api/routers/test":
                 return self._json(200, self.panel.test_router(self._body()))
             if method == "PUT" and m:

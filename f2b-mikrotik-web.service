@@ -10,6 +10,8 @@ Restart=always
 RestartSec=10
 NoNewPrivileges=yes
 ProtectSystem=full
+# /etc fica somente leitura; o painel grava a blacklist e o routers.json aqui
+ReadWritePaths=/etc/f2b-mikrotik
 ProtectHome=yes
 PrivateTmp=yes
 

@@ -113,7 +113,7 @@ No roteador:
 
 ## Painel web
 
-Painel para conferir o que está bloqueado e cadastrar outros MikroTiks. Usa o próprio Python, sem Node e sem dependências, e roda na **porta 8088**.
+Painel para conferir o que está bloqueado, desbanir IPs, editar a blacklist e cadastrar outros MikroTiks. Usa o próprio Python, sem Node e sem dependências, e roda na **porta 8088**.
 
 ```bash
 sudo systemctl enable --now f2b-mikrotik-web
@@ -121,15 +121,28 @@ sudo systemctl enable --now f2b-mikrotik-web
 
 Abra `http://IP-DO-SERVIDOR:8088/` e entre com o usuário `admin` e a senha da seção `[web]` do `/etc/f2b-mikrotik/config.ini`. O `install.sh` gera essa senha e a mostra na tela; ela pode ser trocada no arquivo.
 
-O que o painel mostra:
+O que o painel mostra e faz:
 
-- **Este IP está bloqueado?** Digite um IP ou uma rede. A resposta diz em quais roteadores está bloqueado, por quê (jail do fail2ban, blacklist, ou dentro de uma rede bloqueada) e avisa quando o IP deveria estar bloqueado e ainda não está, ou quando está na whitelist.
-- **Visão geral:** estado de cada roteador (modelo, versão, identity, uptime), jails do fail2ban com os IPs banidos, blacklist e whitelist. Clique num IP para consultá-lo.
-- **Bloqueios:** uma tabela com todos os IPs e uma coluna por roteador (bloqueado, manual, faltando, a remover). O filtro "só divergências" mostra o que o agente ainda não sincronizou.
+- **Este IP está bloqueado?** Digite um IP ou uma rede. A resposta diz em quais roteadores está bloqueado, por quê (jail do fail2ban, blacklist, ou dentro de uma rede bloqueada) e avisa quando o IP deveria estar bloqueado e ainda não está, ou quando está na whitelist. O resultado traz botões para **desbanir** e para **incluir na blacklist** ou **tirar dela**.
+- **Visão geral:** estado de cada roteador e uma tabela única de **bloqueios**. Para cada IP ou rede, mostra:
+  - as jails do fail2ban em que está banido;
+  - se está na blacklist;
+  - o estado em cada MikroTik: bloqueado, manual, faltando ou a remover.
+
+  Os IPs banidos que o agente não replica também aparecem, com o motivo: whitelist, jail fora da lista ou coberto por uma rede da blacklist. Cada linha tem os botões **Desbanir**, **+ Blacklist** e **Tirar da blacklist**. O filtro "só divergências" mostra o que o agente ainda não sincronizou.
+- **Blacklist:** um formulário para incluir um IP ou uma rede com o motivo, e a lista com o botão **Remover**. O painel edita o `blacklist.txt` preservando as linhas e os comentários existentes. Ele recusa entradas que estão na whitelist e redes grandes demais (maiores que /8 no IPv4).
 - **Roteadores:** cadastrar, editar, testar a conexão e excluir MikroTiks.
 - **Log do agente:** as últimas linhas do `/var/log/f2b-mikrotik.log`, com filtro.
 
-O painel só **lê** o fail2ban e os roteadores. Quem bloqueia e libera é o agente.
+Como as ações chegam aos roteadores:
+
+| Ação no painel | O que o painel faz | O que acontece nos MikroTiks |
+|---|---|---|
+| Desbanir | roda `fail2ban-client set <jail> unbanip <ip>` em todas as jails em que o IP está | o agente libera em ~2 s. Se o IP também estiver na blacklist, ele continua bloqueado (o painel avisa). |
+| Incluir na blacklist | acrescenta a linha `IP  # motivo (usuário, data)` ao arquivo | o agente bloqueia em ~2 s |
+| Tirar da blacklist | remove a linha do arquivo | o agente libera em ~2 s. Se o IP também estiver banido no fail2ban, ele continua bloqueado (o painel avisa). |
+
+Cada ação fica registrada no journal do painel (`journalctl -u f2b-mikrotik-web`), com o usuário e o IP de origem.
 
 Configuração (`[web]` no `config.ini`):
 
@@ -140,7 +153,7 @@ Configuração (`[web]` no `config.ini`):
 | `username` / `password` | `admin` / *(gerada)* | o painel não inicia sem senha |
 | `tls_cert` / `tls_key` | *(vazio)* | caminhos do certificado e da chave para usar HTTPS |
 
-Segurança: o painel exige senha e recusa pedidos forjados por outros sites. As senhas dos roteadores nunca são enviadas ao navegador. Sem `tls_cert`, porém, o tráfego é HTTP puro: use o painel só na rede interna, ou configure o HTTPS.
+Segurança: o painel exige senha e recusa pedidos forjados por outros sites. As senhas dos roteadores nunca são enviadas ao navegador. Sem `tls_cert`, porém, o tráfego é HTTP puro: use o painel só na rede interna, ou configure o HTTPS. Quem tem a senha pode desbanir IPs e editar a blacklist, então proteja-a como protegeria o acesso ao servidor.
 
 ## Vários MikroTiks
 

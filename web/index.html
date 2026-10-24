@@ -35,7 +35,6 @@
 
     <nav class="tabs" role="tablist">
       <button type="button" role="tab" data-tab="overview" class="active">Visão geral</button>
-      <button type="button" role="tab" data-tab="entries">Bloqueios <span class="count" id="count-entries"></span></button>
       <button type="button" role="tab" data-tab="routers">Roteadores <span class="count" id="count-routers"></span></button>
       <button type="button" role="tab" data-tab="log">Log do agente</button>
     </nav>
@@ -45,16 +44,8 @@
       <div class="stats" id="stats"></div>
       <h2>Roteadores</h2>
       <div class="router-cards" id="router-cards"></div>
-      <div class="grid-2">
-        <div class="card"><h2>fail2ban</h2><div id="f2b-box"></div></div>
-        <div class="card">
-          <h2>Blacklist</h2><div id="bl-box"></div>
-          <h2 class="mt">Whitelist <span class="muted small">(nunca bloqueados)</span></h2><div id="wl-box"></div>
-        </div>
-      </div>
-    </section>
 
-    <section id="tab-entries" class="tab">
+      <h2>Bloqueios: fail2ban, blacklist e MikroTik <span class="count" id="count-entries"></span></h2>
       <div class="toolbar">
         <input id="entries-filter" class="mono" placeholder="filtrar IP, rede ou jail" spellcheck="false">
         <select id="entries-source">
@@ -74,6 +65,22 @@
         <span class="st st-warn">a remover</span> já liberado, aguardando o agente ·
         <span class="st st-muted">?</span> roteador fora do ar ou desabilitado
       </p>
+
+      <div class="grid-2 mt">
+        <div class="card">
+          <h2>Blacklist <span class="muted small">(bloqueio manual)</span></h2>
+          <form id="bl-form" class="bl-form" autocomplete="off">
+            <input name="entry" class="mono" placeholder="IP ou rede (ex.: 203.0.113.45)" spellcheck="false" required>
+            <input name="comment" placeholder="motivo (opcional)" maxlength="100">
+            <button class="btn primary" type="submit">Incluir</button>
+          </form>
+          <div id="bl-box"></div>
+        </div>
+        <div class="card">
+          <h2>fail2ban <span class="muted small">(jails)</span></h2><div id="f2b-box"></div>
+          <h2 class="mt">Whitelist <span class="muted small">(nunca bloqueados)</span></h2><div id="wl-box"></div>
+        </div>
+      </div>
     </section>
 
     <section id="tab-routers" class="tab">
@@ -136,6 +143,7 @@
     </form>
   </dialog>
 
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <script src="app.js"></script>
 </body>
 </html>
