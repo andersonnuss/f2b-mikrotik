@@ -155,6 +155,31 @@ Configuração (`[web]` no `config.ini`):
 
 Segurança: o painel exige senha e recusa pedidos forjados por outros sites. As senhas dos roteadores nunca são enviadas ao navegador. Sem `tls_cert`, porém, o tráfego é HTTP puro: use o painel só na rede interna, ou configure o HTTPS. Quem tem a senha pode desbanir IPs e editar a blacklist, então proteja-a como protegeria o acesso ao servidor.
 
+## Observabilidade
+
+O agente grava cada evento num histórico local (`/var/lib/f2b-mikrotik/events.db`, SQLite):
+
+- **bloqueio** e **desbloqueio** do fail2ban (`Ban` / `Unban`);
+- **inclusão** e **remoção** na blacklist, contadas também como bloqueio e desbloqueio.
+
+As restaurações de ban após um reinício do fail2ban (`Restore Ban`) ficam guardadas, mas não entram nas contagens, para não contar duas vezes o mesmo ban. Na primeira execução, o agente importa o que ainda estiver no `fail2ban.log` e nos logs rotacionados (inclusive os `.gz`), para que as contagens não comecem do zero. Por padrão, o histórico guarda 365 dias.
+
+No painel:
+
+| Onde | O que mostra |
+|---|---|
+| Tabela de bloqueios | colunas **país** e **bloqueios** (quantas vezes o IP foi bloqueado), com ordenação por "mais bloqueados", "mais recente" ou "país" |
+| Consulta de IP | o país e o histórico (bloqueado N vezes, primeira e última vez, número de desbloqueios e os últimos eventos) |
+| Aba **Estatísticas** | bloqueios e desbloqueios na última hora e no período, média por hora e IPs distintos; gráfico **por hora** (24 h em barras, 7 dias em linhas), com tooltip e tabela; IPs mais bloqueados, bloqueios por país e por jail; últimos eventos |
+
+**País de origem:** vem das tabelas públicas de alocação dos cinco registros regionais (ARIN, RIPE NCC, LACNIC, APNIC e AFRINIC). O painel baixa essas tabelas (~45 MB) na primeira vez e depois uma vez por semana. Elas viram um arquivo de ~1,3 MB em `/var/lib/f2b-mikrotik/geo.tsv.gz`, e toda consulta é local: nenhum IP sai do servidor e não é preciso conta nem chave. É o país em que o bloco de IPs foi registrado, o que na prática corresponde ao país do provedor. Fica como **desconhecido** quando o IP é privado ou reservado, quando não está nas tabelas, ou enquanto a tabela ainda não foi baixada. Para isso funcionar, o servidor precisa acessar `ftp.arin.net`, `ftp.ripe.net`, `ftp.lacnic.net`, `ftp.apnic.net` e `ftp.afrinic.net` por HTTPS. Para baixar ou consultar manualmente:
+
+```bash
+sudo python3 /opt/f2b-mikrotik/f2b_geo.py --update 45.155.205.233
+```
+
+O histórico só é registrado no modo daemon (serviço `f2b-mikrotik`). No modo cron (`--once`), não há registro de eventos.
+
 ## Vários MikroTiks
 
 O roteador do `config.ini` (seção `[mikrotik]`) é o **principal**. Os demais são cadastrados no painel, na aba **Roteadores**, e ficam em `/etc/f2b-mikrotik/routers.json` (permissão 600, porque contém as senhas).
@@ -215,6 +240,8 @@ Uma trava (`/run/f2b-mikrotik.lock`) impede duas execuções simultâneas.
 | `[blacklist] file` | arquivo de bloqueios manuais (vazio desativa) |
 | `[mikrotik] name` | nome do roteador principal no log e no painel |
 | `[agent] routers_file` | arquivo dos roteadores cadastrados pelo painel |
+| `[agent] events_db` / `events_retention_days` | histórico de eventos e por quantos dias guardar |
+| `[web] geoip` / `geo_file` | país de origem (tabelas dos RIRs) |
 | `entry_timeout` | ex.: `7d`. As entradas expiram sozinhas no roteador se o agente for desinstalado ou parar; enquanto o IP seguir banido, o agente o recoloca |
 | `ipv6` | replica também para `/ipv6 firewall address-list` |
 | `use_ssl` / `port` | usar `api-ssl` (8729) |

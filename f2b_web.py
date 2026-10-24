@@ -32,6 +32,7 @@ from urllib.parse import parse_qs, urlparse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import f2b_geo  # noqa: E402
 import f2b_mikrotik as core  # noqa: E402
 
 STATIC_DIR = os.path.join(HERE, "web")
@@ -84,6 +85,105 @@ class Panel:
         self.agent_log = cfg["agent"].get("logfile").strip()
         self.write_lock = threading.Lock()
         self.pool = ThreadPoolExecutor(max_workers=8)
+        self.events = self.agent.open_events()  # o agente grava; o painel so consulta
+        self.geo = self.geo_updater = None
+        if cfg["web"].getboolean("geoip"):
+            self.geo = f2b_geo.GeoDB(cfg["web"].get("geo_file").strip() or f2b_geo.DEFAULT_FILE)
+            self.geo_updater = f2b_geo.GeoUpdater(self.geo)
+            self.geo_updater.start()
+
+    # -- observabilidade ----------------------------------------------------------
+    def country(self, key):
+        """Codigo ISO do pais (ou None = desconhecido)."""
+        return self.geo.lookup(key) if self.geo is not None and self.geo.ready else None
+
+    def _events(self, sql, args=()):
+        if self.events is None:
+            return []
+        try:
+            return self.events.query(sql, args)
+        except core.sqlite3.Error as e:
+            log.warning("historico indisponivel: %s", e)
+            return []
+
+    def block_counts(self):
+        """{ip: (vezes bloqueado, ultimo bloqueio)} de todo o historico."""
+        rows = self._events("SELECT ip, COUNT(*), MAX(ts) FROM events WHERE kind IN ('ban', 'bl-add') GROUP BY ip")
+        return {ip: (n, last) for ip, n, last in rows}
+
+    def meta(self):
+        first = self._events("SELECT MIN(ts) FROM events")
+        return {"events": self.events is not None, "events_since": first[0][0] if first else None,
+                "geo": self.geo is not None, "geo_ready": bool(self.geo and self.geo.ready),
+                "geo_updated": self.geo.updated_at() if self.geo else None,
+                "geo_error": self.geo_updater.last_error if self.geo_updater else None}
+
+    def stats(self, hours):
+        now = int(time.time())
+        end = (now // 3600 + 1) * 3600
+        start = end - hours * 3600
+        buckets = {h: [0, 0] for h in range(start // 3600, end // 3600)}
+        for h, blocks, unblocks in self._events(
+                "SELECT ts / 3600, SUM(kind IN ('ban', 'bl-add')), SUM(kind IN ('unban', 'bl-del')) "
+                "FROM events WHERE ts >= ? GROUP BY ts / 3600", (start,)):
+            if h in buckets:
+                buckets[h] = [blocks, unblocks]
+        series = [{"ts": h * 3600, "blocks": b, "unblocks": u} for h, (b, u) in sorted(buckets.items())]
+
+        def count(kinds, since):
+            marks = ",".join("?" * len(kinds))
+            row = self._events("SELECT COUNT(*) FROM events WHERE kind IN (%s) AND ts >= ?" % marks,
+                               tuple(kinds) + (since,))
+            return row[0][0] if row else 0
+
+        blocks = sum(s["blocks"] for s in series)
+        unblocks = sum(s["unblocks"] for s in series)
+        peak = max(series, key=lambda s: s["blocks"]) if series else None
+        totals = {"blocks_1h": count(core.EventStore.BLOCK_KINDS, now - 3600),
+                  "unblocks_1h": count(core.EventStore.UNBLOCK_KINDS, now - 3600),
+                  "blocks": blocks, "unblocks": unblocks, "avg_per_hour": round(blocks / hours, 1),
+                  "peak_ts": peak["ts"] if peak and peak["blocks"] else None,
+                  "peak_blocks": peak["blocks"] if peak else 0}
+
+        per_ip = self._events(
+            "SELECT ip, COUNT(*), MAX(ts), GROUP_CONCAT(DISTINCT jail) FROM events "
+            "WHERE kind IN ('ban', 'bl-add') AND ts >= ? GROUP BY ip", (start,))
+        all_time = self.block_counts()
+        countries = {}
+        for ip, n, _last, _jails in per_ip:
+            cc = self.country(ip) or "??"
+            c = countries.setdefault(cc, {"country": cc if cc != "??" else None, "blocks": 0, "ips": 0})
+            c["blocks"] += n
+            c["ips"] += 1
+        top_ips = sorted(per_ip, key=lambda r: (-r[1], -r[2]))[:20]
+        jails = self._events("SELECT jail, COUNT(*) FROM events WHERE kind IN ('ban', 'bl-add') AND ts >= ? "
+                             "GROUP BY jail ORDER BY 2 DESC LIMIT 10", (start,))
+        recent = self._events("SELECT ts, kind, ip, jail FROM events WHERE kind != 'restore' "
+                              "ORDER BY ts DESC, rowid DESC LIMIT 30")
+        return {
+            "hours": hours, "series": series, "totals": totals, "unique_ips": len(per_ip),
+            "top_ips": [{"ip": ip, "blocks": n, "last": last, "jails": (j or "").split(","),
+                         "total": all_time.get(ip, (n, last))[0], "country": self.country(ip)}
+                        for ip, n, last, j in top_ips],
+            "top_countries": sorted(countries.values(), key=lambda c: -c["blocks"])[:15],
+            "top_jails": [{"jail": j, "blocks": n} for j, n in jails],
+            "recent": [{"ts": ts, "kind": k, "ip": ip, "jail": j, "country": self.country(ip)}
+                       for ts, k, ip, j in recent],
+            "meta": self.meta(),
+        }
+
+    def history(self, target):
+        """Historico de um IP (ou de tudo dentro de uma rede consultada)."""
+        if core.is_network(target):
+            rows = [r for r in self._events("SELECT ts, kind, ip, jail FROM events ORDER BY ts DESC")
+                    if relation(target, core.normalize_ip(r[2])) in ("igual", "contem")]
+        else:
+            rows = self._events("SELECT ts, kind, ip, jail FROM events WHERE ip = ? ORDER BY ts DESC",
+                                (str(target),))
+        blocks = [r for r in rows if r[1] in core.EventStore.BLOCK_KINDS]
+        return {"blocks": len(blocks), "unblocks": sum(1 for r in rows if r[1] in core.EventStore.UNBLOCK_KINDS),
+                "first": blocks[-1][0] if blocks else None, "last": blocks[0][0] if blocks else None,
+                "recent": [{"ts": ts, "kind": k, "ip": ip, "jail": j} for ts, k, ip, j in rows[:15]]}
 
     # -- leitura ------------------------------------------------------------------
     def routers(self):
@@ -184,13 +284,16 @@ class Panel:
         keys = set(desired) | set(f2b_ips)
         for r in routers:
             keys.update(row["key"] for row in r["rows"])
+        counts = self.block_counts()
         entries = []
         for key in sorted(keys, key=sort_key):
             jails = sorted(f2b_ips.get(key, ()))
             entry = core.normalize_ip(key)
             item = {"key": key, "jails": jails, "blacklist": key in blacklist, "expected": key in desired,
                     "sources": jails + (["blacklist"] if key in blacklist else []), "note": "",
-                    "whitelisted": entry is not None and a._whitelisted(entry), "routers": {}}
+                    "whitelisted": entry is not None and a._whitelisted(entry), "routers": {},
+                    "blocks": counts.get(key, (0, None))[0], "last_block": counts.get(key, (0, None))[1],
+                    "country": self.country(entry) if entry is not None else None}
             if jails and key not in desired:
                 cover = next((n for n in bl_networks if entry is not None and entry.version == n.version
                               and entry in n), None)
@@ -232,7 +335,8 @@ class Panel:
                 "list_name": a.list_name,
                 "families": a.families, "fail2ban": f2b, "blacklist": bl,
                 "whitelist": [str(n) for n in a.whitelist], "desired_count": len(desired),
-                "routers": routers, "entries": entries, "agent_service": service_state("f2b-mikrotik")}
+                "routers": routers, "entries": entries, "agent_service": service_state("f2b-mikrotik"),
+                "meta": self.meta()}
 
     def check(self, text):
         target = core.normalize_ip(text or "")
@@ -247,7 +351,8 @@ class Panel:
         result = {"query": str(target), "is_network": core.is_network(target),
                   "whitelist": [], "fail2ban": {"ok": f2b["ok"], "error": f2b["error"], "matches": []},
                   "blacklist": {"ok": bl["ok"], "error": bl["error"], "matches": []},
-                  "desired": [], "routers": []}
+                  "desired": [], "routers": [], "country": self.country(target),
+                  "history": self.history(target), "meta": self.meta()}
         for net in a.whitelist:
             rel = relation(target, net)
             if rel:
@@ -591,6 +696,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, self.panel.overview())
             if method == "GET" and path == "/api/check":
                 return self._json(200, self.panel.check(query.get("ip", [""])[0]))
+            if method == "GET" and path == "/api/stats":
+                try:
+                    hours = int(query.get("hours", ["24"])[0])
+                except ValueError:
+                    hours = 24
+                return self._json(200, self.panel.stats(max(1, min(hours, 24 * 31))))
             if method == "GET" and path == "/api/log":
                 lines = max(10, min(int(query.get("lines", ["300"])[0] or 300), 5000))
                 return self._json(200, self.panel.agent_log_tail(lines))

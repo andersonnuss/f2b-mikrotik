@@ -13,11 +13,13 @@ install -d -m 755 "$DEST"
 if [ "$SRC" != "$DEST" ]; then
     install -m 755 "$SRC/f2b_mikrotik.py" "$DEST/f2b_mikrotik.py"
     install -m 755 "$SRC/f2b_web.py" "$DEST/f2b_web.py"
+    install -m 755 "$SRC/f2b_geo.py" "$DEST/f2b_geo.py"
     install -d -m 755 "$DEST/web"
     install -m 644 "$SRC"/web/* "$DEST/web/"
 fi
 
 install -d -m 700 /etc/f2b-mikrotik
+install -d -m 750 /var/lib/f2b-mikrotik   # historico de eventos e tabela de paises
 if [ -f /etc/f2b-mikrotik/config.ini ]; then
     echo "Mantido o /etc/f2b-mikrotik/config.ini existente"
     grep -q '^\[blacklist\]' /etc/f2b-mikrotik/config.ini ||

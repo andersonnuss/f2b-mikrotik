@@ -35,6 +35,7 @@
 
     <nav class="tabs" role="tablist">
       <button type="button" role="tab" data-tab="overview" class="active">Visão geral</button>
+      <button type="button" role="tab" data-tab="stats">Estatísticas</button>
       <button type="button" role="tab" data-tab="routers">Roteadores <span class="count" id="count-routers"></span></button>
       <button type="button" role="tab" data-tab="log">Log do agente</button>
     </nav>
@@ -53,6 +54,12 @@
           <option value="fail2ban">fail2ban</option>
           <option value="blacklist">blacklist</option>
           <option value="router">só no roteador (manual)</option>
+        </select>
+        <select id="entries-sort">
+          <option value="ip">ordenar por IP</option>
+          <option value="blocks">mais bloqueados</option>
+          <option value="recent">bloqueio mais recente</option>
+          <option value="country">país</option>
         </select>
         <label class="check-inline"><input type="checkbox" id="entries-diff"> só divergências</label>
         <span class="muted small" id="entries-info"></span>
@@ -81,6 +88,41 @@
           <h2 class="mt">Whitelist <span class="muted small">(nunca bloqueados)</span></h2><div id="wl-box"></div>
         </div>
       </div>
+    </section>
+
+    <section id="tab-stats" class="tab viz-root">
+      <div class="toolbar">
+        <div class="segmented" role="group" aria-label="período">
+          <button type="button" data-hours="24" class="active">Últimas 24 h</button>
+          <button type="button" data-hours="168">7 dias</button>
+        </div>
+        <span class="muted small" id="stats-meta"></span>
+      </div>
+      <div id="stats-error"></div>
+      <div class="stats" id="stats-kpis"></div>
+      <div class="card chart-card">
+        <div class="chart-head">
+          <h2 id="chart-title">Bloqueios e desbloqueios por hora</h2>
+          <div class="legend-row">
+            <span class="legend-item"><span class="swatch s1"></span>bloqueios</span>
+            <span class="legend-item"><span class="swatch s2"></span>desbloqueios</span>
+          </div>
+        </div>
+        <div class="chart" id="hourly-chart"></div>
+        <details class="mt"><summary class="muted small">ver como tabela</summary>
+          <div class="table-wrap mt"><table class="table" id="hourly-table"></table></div>
+        </details>
+      </div>
+      <div class="grid-2 mt">
+        <div class="card"><h2>IPs mais bloqueados <span class="muted small" id="top-ips-period"></span></h2>
+          <div class="table-wrap"><table class="table" id="top-ips"></table></div></div>
+        <div class="card">
+          <h2>Bloqueios por país</h2><div id="top-countries" class="hbars"></div>
+          <h2 class="mt">Bloqueios por jail</h2><div id="top-jails" class="hbars"></div>
+        </div>
+      </div>
+      <div class="card mt"><h2>Últimos eventos</h2>
+        <div class="table-wrap"><table class="table" id="recent-events"></table></div></div>
     </section>
 
     <section id="tab-routers" class="tab">

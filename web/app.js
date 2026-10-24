@@ -50,6 +50,31 @@ const relText = (m) => (m.relation === "igual" ? esc(m.entry) : `${REL_TEXT[m.re
 let overview = null;
 let routersCache = [];
 
+// pais: codigo ISO -> bandeira + nome em portugues; sem codigo -> "desconhecido"
+let regionNames = null;
+try { regionNames = new Intl.DisplayNames(["pt-BR"], { type: "region" }); } catch (_) { /* navegador antigo */ }
+function countryName(cc) {
+  if (!cc) return "desconhecido";
+  try { return (regionNames && regionNames.of(cc)) || cc; } catch (_) { return cc; }
+}
+function flag(cc) {
+  return cc && /^[A-Z]{2}$/.test(cc) ? String.fromCodePoint(...[...cc].map((c) => 0x1f1a5 + c.charCodeAt(0))) : "";
+}
+function countryLabel(cc) {
+  return cc ? `<span title="${esc(cc)}">${flag(cc)} ${esc(countryName(cc))}</span>` : '<span class="muted">desconhecido</span>';
+}
+const pad = (n) => String(n).padStart(2, "0");
+function fmtTs(ts, withDate = true) {
+  if (!ts) return "—";
+  const d = new Date(ts * 1000);
+  const hm = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  return withDate ? `${pad(d.getDate())}/${pad(d.getMonth() + 1)} ${hm}` : hm;
+}
+const KIND_LABEL = { ban: "bloqueio (fail2ban)", unban: "desbloqueio (fail2ban)", restore: "restaurado",
+  "bl-add": "incluído na blacklist", "bl-del": "removido da blacklist" };
+const KIND_CLASS = { ban: "st-bad", "bl-add": "st-bad", unban: "st-ok", "bl-del": "st-ok", restore: "st-muted" };
+const kindBadge = (k) => `<span class="st ${KIND_CLASS[k] || ""}">${esc(KIND_LABEL[k] || k)}</span>`;
+
 // ---------------------------------------------------------------------------
 // abas
 // ---------------------------------------------------------------------------
@@ -57,6 +82,7 @@ function showTab(name) {
   $$(".tabs button").forEach((b) => b.classList.toggle("active", b.dataset.tab === name));
   $$(".tab").forEach((t) => t.classList.toggle("active", t.id === `tab-${name}`));
   if (name === "log") loadLog();
+  if (name === "stats") loadStats();
   try { localStorage.setItem("f2b-tab", name); } catch (_) { /* sem storage */ }
 }
 $$(".tabs button").forEach((b) => b.addEventListener("click", () => showTab(b.dataset.tab)));
@@ -179,20 +205,27 @@ function renderEntries() {
     return true;
   });
 
+  const sort = $("#entries-sort").value;
+  if (sort === "blocks") rows.sort((a, b) => b.blocks - a.blocks || (b.last_block || 0) - (a.last_block || 0));
+  if (sort === "recent") rows.sort((a, b) => (b.last_block || 0) - (a.last_block || 0));
+  if (sort === "country") rows.sort((a, b) => countryName(a.country).localeCompare(countryName(b.country), "pt-BR") || b.blocks - a.blocks);
+
   $("#count-entries").textContent = overview.entries.length;
   $("#entries-info").textContent = `${rows.length} de ${overview.entries.length}`;
-  const head = `<thead><tr><th>IP / rede</th><th>fail2ban</th><th>blacklist</th>
+  const head = `<thead><tr><th>IP / rede</th><th>país</th><th class="num" title="quantas vezes foi bloqueado (histórico)">bloqueios</th><th>fail2ban</th><th>blacklist</th>
     ${routers.map((r) => `<th class="center">${esc(r.name)}</th>`).join("")}<th></th></tr></thead>`;
   const body = rows.length ? rows.slice(0, 3000).map((e) => `<tr>
       <td><button type="button" class="link mono" data-check="${esc(e.key)}">${esc(e.key)}</button>
         ${e.note ? `<div class="muted small">${esc(e.note)}</div>` : ""}
         ${!e.sources.length ? '<div class="muted small">só no roteador</div>' : ""}</td>
+      <td class="nowrap">${countryLabel(e.country)}</td>
+      <td class="num" title="${e.last_block ? `último bloqueio: ${fmtTs(e.last_block)}` : "sem registro no histórico"}">${e.blocks || '<span class="muted">0</span>'}</td>
       <td>${e.jails.map((j) => `<span class="pill">${esc(j)}</span>`).join(" ")}</td>
       <td>${e.blacklist ? '<span class="pill info">sim</span>' : ""}</td>
       ${routers.map((r) => `<td class="center">${stateBadge(e.routers[r.id])}</td>`).join("")}
       <td><div class="actions">${rowActions(e)}</div></td>
     </tr>`).join("")
-    : `<tr><td colspan="${routers.length + 4}" class="empty">nada encontrado</td></tr>`;
+    : `<tr><td colspan="${routers.length + 6}" class="empty">nada encontrado</td></tr>`;
   $("#entries-table").innerHTML = head + `<tbody>${body}</tbody>`;
 }
 
@@ -284,7 +317,7 @@ $("#bl-form").addEventListener("submit", async (ev) => {
     toast(e.message, "bad");
   }
 });
-["#entries-filter", "#entries-source", "#entries-diff"].forEach((s) => $(s).addEventListener("input", renderEntries));
+["#entries-filter", "#entries-source", "#entries-diff", "#entries-sort"].forEach((s) => $(s).addEventListener("input", renderEntries));
 
 // ---------------------------------------------------------------------------
 // consulta de IP
@@ -319,6 +352,16 @@ function renderCheck(c) {
   }
 
   const facts = [];
+  facts.push(`País: ${c.is_network ? "da rede: " : ""}${countryLabel(c.country)}`);
+  const h = c.history;
+  if (!c.meta.events) facts.push('<span class="muted">Histórico desativado no config.ini ([agent] events_db).</span>');
+  else if (h.blocks || h.unblocks) {
+    facts.push(`Histórico: <strong>bloqueado ${h.blocks} ${h.blocks === 1 ? "vez" : "vezes"}</strong>`
+      + (h.blocks ? ` (primeira em ${fmtTs(h.first)}, última em ${fmtTs(h.last)})` : "")
+      + ` · ${h.unblocks} desbloqueio(s)`
+      + `<details class="history"><summary class="muted small">últimos eventos</summary><ul>${h.recent.map((ev) =>
+        `<li>${fmtTs(ev.ts)} ${kindBadge(ev.kind)} <span class="muted small">${esc(ev.jail)}${c.is_network ? ` · ${esc(ev.ip)}` : ""}</span></li>`).join("")}</ul></details>`);
+  } else facts.push("Histórico: nunca foi bloqueado.");
   if (c.whitelist.length) {
     facts.push(`Na <strong>whitelist</strong> (${c.whitelist.map(relText).join(", ")}): o agente nunca bloqueia este endereço.`);
   }
@@ -528,6 +571,177 @@ $("#delete-confirm").addEventListener("click", async () => {
 });
 
 // ---------------------------------------------------------------------------
+// estatisticas
+// ---------------------------------------------------------------------------
+let statsHours = 24;
+let statsData = null;
+
+async function loadStats() {
+  try {
+    statsData = await api(`/api/stats?hours=${statsHours}`);
+    $("#stats-error").innerHTML = "";
+    renderStats();
+  } catch (e) {
+    $("#stats-error").innerHTML = `<div class="alert">Falha ao carregar: ${esc(e.message)}</div>`;
+  }
+}
+
+$$(".segmented button").forEach((b) => b.addEventListener("click", () => {
+  statsHours = Number(b.dataset.hours);
+  $$(".segmented button").forEach((x) => x.classList.toggle("active", x === b));
+  loadStats();
+}));
+
+function renderStats() {
+  const s = statsData;
+  const t = s.totals;
+  const m = s.meta;
+  const period = s.hours === 24 ? "24 h" : `${s.hours / 24} dias`;
+  $("#stats-meta").innerHTML = [
+    m.events ? (m.events_since ? `histórico desde ${fmtTs(m.events_since)}` : "histórico vazio") : "histórico desativado",
+    !m.geo ? "países desativados" : m.geo_ready ? `países: tabela dos RIRs de ${esc(m.geo_updated)}`
+      : (m.geo_error ? `países indisponíveis (${esc(m.geo_error)})` : "países: baixando tabela dos RIRs…"),
+  ].join(" · ");
+  $("#stats-kpis").innerHTML = [
+    [t.blocks_1h, "bloqueios na última hora"],
+    [t.unblocks_1h, "desbloqueios na última hora"],
+    [t.blocks, `bloqueios em ${period}`],
+    [t.unblocks, `desbloqueios em ${period}`],
+    [t.avg_per_hour.toLocaleString("pt-BR"), "bloqueios por hora (média)"],
+    [s.unique_ips, `IPs distintos bloqueados em ${period}`],
+  ].map(([v, l]) => `<div class="stat"><div class="v">${esc(v)}</div><div class="l">${esc(l)}</div></div>`).join("");
+  $("#chart-title").textContent = `Bloqueios e desbloqueios por hora · ${period}`
+    + (t.peak_ts ? ` · pico de ${t.peak_blocks} às ${fmtTs(t.peak_ts)}` : "");
+
+  drawHourly(s.series);
+  $("#hourly-table").innerHTML = "<thead><tr><th>hora</th><th class=\"num\">bloqueios</th><th class=\"num\">desbloqueios</th></tr></thead><tbody>"
+    + s.series.slice().reverse().map((p) => `<tr><td>${fmtTs(p.ts)}</td><td class="num">${p.blocks}</td><td class="num">${p.unblocks}</td></tr>`).join("")
+    + "</tbody>";
+
+  $("#top-ips-period").textContent = `(${period})`;
+  $("#top-ips").innerHTML = s.top_ips.length
+    ? `<thead><tr><th>IP</th><th>país</th><th class="num">no período</th><th class="num">total</th><th>jail</th><th>último</th></tr></thead><tbody>`
+      + s.top_ips.map((r) => `<tr>
+          <td><button type="button" class="link mono" data-check="${esc(r.ip)}">${esc(r.ip)}</button></td>
+          <td class="nowrap">${countryLabel(r.country)}</td>
+          <td class="num">${r.blocks}</td><td class="num">${r.total}</td>
+          <td>${r.jails.map((j) => `<span class="pill">${esc(j)}</span>`).join(" ")}</td>
+          <td class="nowrap">${fmtTs(r.last)}</td></tr>`).join("") + "</tbody>"
+    : '<tbody><tr><td class="empty">nenhum bloqueio no período</td></tr></tbody>';
+
+  hbars("#top-countries", s.top_countries.map((c) => ({ label: countryLabel(c.country), value: c.blocks, extra: `${c.ips} IP(s)` })));
+  hbars("#top-jails", s.top_jails.map((j) => ({ label: esc(j.jail), value: j.blocks })));
+
+  $("#recent-events").innerHTML = s.recent.length
+    ? "<thead><tr><th>quando</th><th>evento</th><th>IP</th><th>país</th><th>jail / origem</th></tr></thead><tbody>"
+      + s.recent.map((ev) => `<tr><td class="nowrap">${fmtTs(ev.ts)}</td><td>${kindBadge(ev.kind)}</td>
+          <td><button type="button" class="link mono" data-check="${esc(ev.ip)}">${esc(ev.ip)}</button></td>
+          <td class="nowrap">${countryLabel(ev.country)}</td><td>${esc(ev.jail)}</td></tr>`).join("") + "</tbody>"
+    : '<tbody><tr><td class="empty">nenhum evento registrado ainda</td></tr></tbody>';
+}
+
+// barras horizontais de uma serie so (o titulo nomeia a serie; sem legenda)
+function hbars(sel, items) {
+  const max = Math.max(1, ...items.map((i) => i.value));
+  $(sel).innerHTML = items.length ? items.map((i) => `
+    <div class="hbar-row">
+      <div class="hbar-label">${i.label}</div>
+      <div class="hbar-track"><div class="hbar-fill" data-w="${(i.value / max) * 100}"></div></div>
+      <div class="hbar-value">${i.value}${i.extra ? ` <span class="muted small">· ${esc(i.extra)}</span>` : ""}</div>
+    </div>`).join("") : '<p class="muted small">nenhum bloqueio no período</p>';
+  // largura via CSSOM: a CSP do painel nao permite style="" inline
+  $$(`${sel} .hbar-fill`).forEach((el) => { el.style.width = `${el.dataset.w}%`; });
+}
+
+// barras agrupadas por hora: azul = bloqueios, laranja = desbloqueios, um eixo so
+function drawHourly(series) {
+  const box = $("#hourly-chart");
+  const W = Math.max(320, box.clientWidth || 900);
+  const H = 240;
+  const M = { top: 12, right: 8, bottom: 26, left: 36 };
+  const iw = W - M.left - M.right;
+  const ih = H - M.top - M.bottom;
+  const n = series.length;
+  const maxV = Math.max(1, ...series.map((p) => Math.max(p.blocks, p.unblocks)));
+  const step = niceStep(maxV);
+  const top = Math.ceil(maxV / step) * step;
+  const y = (v) => M.top + ih - (v / top) * ih;
+  const slot = iw / n;
+  const gap = 2;
+  const bw = Math.max(1, Math.min(14, (slot - gap * 2) / 2));
+
+  const bar = (x, v, cls) => {
+    if (!v) return "";
+    const h = ih * (v / top);
+    const r = Math.min(4, bw / 2, h);
+    const y0 = M.top + ih;
+    return `<path class="${cls}" d="M${x},${y0} V${y0 - h + r} Q${x},${y0 - h} ${x + r},${y0 - h} H${x + bw - r} Q${x + bw},${y0 - h} ${x + bw},${y0 - h + r} V${y0} Z"/>`;
+  };
+
+  let grid = "";
+  for (let v = 0; v <= top; v += step) {
+    grid += `<line class="grid" x1="${M.left}" x2="${W - M.right}" y1="${y(v)}" y2="${y(v)}"/>`
+      + `<text class="axis" x="${M.left - 6}" y="${y(v) + 4}" text-anchor="end">${v}</text>`;
+  }
+  const every = n <= 24 ? 3 : 24;
+  // ate 48 h: barras agrupadas; acima disso as barras ficariam com 1 px, entao vira linha
+  const asLines = n > 48;
+  let labels = "";
+  let bars = "";
+  if (asLines) {
+    const pts = (key) => series.map((p, i) => `${(M.left + slot * i + slot / 2).toFixed(1)},${y(p[key]).toFixed(1)}`).join(" ");
+    bars = `<polyline class="l2" points="${pts("unblocks")}"/><polyline class="l1" points="${pts("blocks")}"/>`;
+  }
+  series.forEach((p, i) => {
+    const cx = M.left + slot * i + slot / 2;
+    if (!asLines) bars += bar(cx - bw - gap / 2, p.blocks, "b1") + bar(cx + gap / 2, p.unblocks, "b2");
+    const d = new Date(p.ts * 1000);
+    if (d.getHours() % every === 0) {
+      const txt = n <= 24 ? `${pad(d.getHours())}h` : `${pad(d.getDate())}/${pad(d.getMonth() + 1)}`;
+      labels += `<text class="axis" x="${cx}" y="${H - 8}" text-anchor="middle">${txt}</text>`;
+    }
+  });
+
+  box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img"
+      aria-label="Bloqueios e desbloqueios por hora">${grid}<g>${bars}</g>${labels}
+      <line class="hover-line" x1="0" x2="0" y1="${M.top}" y2="${M.top + ih}" visibility="hidden"/></svg>
+    <div class="chart-tip" hidden></div>`;
+
+  const svg = box.querySelector("svg");
+  const tip = box.querySelector(".chart-tip");
+  const line = box.querySelector(".hover-line");
+  svg.addEventListener("mousemove", (ev) => {
+    const rect = svg.getBoundingClientRect();
+    const x = (ev.clientX - rect.left) * (W / rect.width);
+    const i = Math.floor((x - M.left) / slot);
+    if (i < 0 || i >= n) { tip.hidden = true; line.setAttribute("visibility", "hidden"); return; }
+    const p = series[i];
+    const cx = M.left + slot * i + slot / 2;
+    line.setAttribute("x1", cx); line.setAttribute("x2", cx); line.setAttribute("visibility", "visible");
+    const end = new Date((p.ts + 3600) * 1000);
+    tip.innerHTML = `<div class="tip-title">${fmtTs(p.ts)}–${pad(end.getHours())}:00</div>
+      <div><span class="swatch s1"></span>bloqueios <strong>${p.blocks}</strong></div>
+      <div><span class="swatch s2"></span>desbloqueios <strong>${p.unblocks}</strong></div>`;
+    tip.hidden = false;
+    const px = (cx / W) * rect.width;
+    tip.style.left = `${Math.min(Math.max(px + 12, 0), rect.width - 170)}px`;
+    tip.style.top = "8px";
+  });
+  svg.addEventListener("mouseleave", () => { tip.hidden = true; line.setAttribute("visibility", "hidden"); });
+}
+
+function niceStep(max) {
+  const raw = max / 4;
+  const pow = 10 ** Math.floor(Math.log10(raw));
+  const f = raw / pow;
+  return Math.max(1, (f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10) * pow);
+}
+
+window.addEventListener("resize", () => {
+  if (statsData && $("#tab-stats").classList.contains("active")) drawHourly(statsData.series);
+});
+
+// ---------------------------------------------------------------------------
 // log do agente
 // ---------------------------------------------------------------------------
 let logLines = [];
@@ -568,6 +782,7 @@ function setAuto(on) {
   timer = on ? setInterval(() => {
     loadOverview();
     if ($("#tab-log").classList.contains("active")) loadLog();
+    if ($("#tab-stats").classList.contains("active")) loadStats();
   }, 30000) : null;
   try { localStorage.setItem("f2b-auto", on ? "1" : "0"); } catch (_) { /* sem storage */ }
 }

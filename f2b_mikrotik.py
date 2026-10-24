@@ -32,6 +32,8 @@ import argparse
 import ast
 import binascii
 import configparser
+import glob
+import gzip
 import hashlib
 import ipaddress
 import json
@@ -42,12 +44,14 @@ import re
 import shlex
 import signal
 import socket
+import sqlite3
 import ssl
 import subprocess
 import sys
+import threading
 import time
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 log = logging.getLogger("f2b-mikrotik")
 
@@ -263,6 +267,90 @@ class Fail2ban:
 
 EVENT_RE = re.compile(r"fail2ban\.actions.*?\[(?P<jail>[^\]]+)\]\s+"
                       r"(?P<action>Restore Ban|Ban|Unban)\s+(?P<ip>[0-9A-Fa-f:.]+)")
+LINE_TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
+EVENT_KINDS = {"Ban": "ban", "Unban": "unban", "Restore Ban": "restore"}
+
+
+def parse_event_line(line):
+    """Linha do fail2ban.log -> (ts, tipo, jail, ip) ou None. Sem data na linha, usa a hora atual."""
+    m = EVENT_RE.search(line)
+    if not m:
+        return None
+    ts = None
+    t = LINE_TS_RE.match(line)
+    if t:
+        try:
+            ts = int(time.mktime(time.strptime(t.group(1), "%Y-%m-%d %H:%M:%S")))
+        except (ValueError, OverflowError):
+            ts = None
+    return (ts or int(time.time()), EVENT_KINDS[m.group("action")], m.group("jail"), m.group("ip"))
+
+
+class EventStore:
+    """Historico de bloqueios/desbloqueios (SQLite), para contagens e estatisticas.
+
+    tipos: ban / unban / restore (fail2ban) e bl-add / bl-del (blacklist)."""
+
+    BLOCK_KINDS = ("ban", "bl-add")
+    UNBLOCK_KINDS = ("unban", "bl-del")
+
+    def __init__(self, path):
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        self.path = path
+        self.db = sqlite3.connect(path, timeout=10, isolation_level=None, check_same_thread=False)
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("CREATE TABLE IF NOT EXISTS events (ts INTEGER NOT NULL, kind TEXT NOT NULL, "
+                        "ip TEXT NOT NULL, jail TEXT NOT NULL, source TEXT NOT NULL)")
+        self.db.execute("CREATE INDEX IF NOT EXISTS events_ts ON events (ts)")
+        self.db.execute("CREATE INDEX IF NOT EXISTS events_ip ON events (ip, kind)")
+        self.lock = threading.Lock()
+
+    def add_many(self, rows):
+        """rows: [(ts, tipo, ip, jail, origem)]"""
+        if rows:
+            with self.lock:
+                # uma transacao so: em autocommit cada linha seria um commit (lento e visivel pela metade)
+                self.db.execute("BEGIN")
+                try:
+                    self.db.executemany("INSERT INTO events VALUES (?, ?, ?, ?, ?)", rows)
+                    self.db.execute("COMMIT")
+                except sqlite3.Error:
+                    self.db.execute("ROLLBACK")
+                    raise
+
+    def is_empty(self):
+        with self.lock:
+            return self.db.execute("SELECT 1 FROM events LIMIT 1").fetchone() is None
+
+    def purge(self, days):
+        with self.lock:
+            return self.db.execute("DELETE FROM events WHERE ts < ?", (int(time.time()) - days * 86400,)).rowcount
+
+    def query(self, sql, args=()):
+        with self.lock:
+            return self.db.execute(sql, args).fetchall()
+
+
+def import_fail2ban_history(store, logfile):
+    """Primeira execucao: importa os eventos que ainda estao no fail2ban.log e nos logs rotacionados."""
+    paths = sorted(glob.glob(logfile + ".*"), reverse=True) + [logfile]
+    rows = []
+    for path in paths:
+        opener = gzip.open if path.endswith(".gz") else open
+        try:
+            with opener(path, "rt", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    ev = parse_event_line(line)
+                    if ev:
+                        ts, kind, jail, ip = ev
+                        key = normalize_ip(ip)
+                        rows.append((ts, kind, str(key) if key is not None else ip, jail, "fail2ban"))
+        except OSError as e:
+            log.warning("historico: nao foi possivel ler %s: %s", path, e)
+    store.add_many(rows)
+    return len(rows)
 
 
 class LogWatcher:
@@ -320,12 +408,7 @@ class LogWatcher:
             self.fh.seek(0)
             self.partial = ""
             lines += self._read()
-        events = []
-        for line in lines:
-            m = EVENT_RE.search(line)
-            if m:
-                events.append((m.group("action"), m.group("jail"), m.group("ip")))
-        return events
+        return [ev for ev in map(parse_event_line, lines) if ev]
 
 
 # --------------------------------------------------------------------------- #
@@ -429,6 +512,10 @@ class Agent:
         self.whitelist = [ipaddress.ip_network(n, strict=False) for n in parse_list(f2b.get("whitelist"))]
         self.blacklist_file = cfg["blacklist"].get("file").strip()
         self.routers_file = ag.get("routers_file").strip()
+        self.events_db = ag.get("events_db").strip()
+        self.events_retention = ag.getint("events_retention_days")
+        self.events = None
+        self._last_f2b = None
         self.sync_interval = ag.getfloat("sync_interval")
         self.debounce = ag.getfloat("debounce")
         self.retry_delay = ag.getfloat("retry_delay")
@@ -468,6 +555,41 @@ class Agent:
             log.info("lista de roteadores atualizada: %s", self.describe_routers())
         self._routers_loaded = True
         return True
+
+    # -- historico de eventos -------------------------------------------------------
+    def open_events(self, import_history=False):
+        """Abre o historico (SQLite). Na primeira vez importa o que ainda esta no log do fail2ban."""
+        if not self.events_db:
+            return None
+        try:
+            self.events = EventStore(self.events_db)
+            if import_history and self.f2b_log and self.events.is_empty():
+                n = import_fail2ban_history(self.events, self.f2b_log)
+                log.info("historico: %d evento(s) importados de %s*", n, self.f2b_log)
+            if import_history and self.events_retention > 0:
+                purged = self.events.purge(self.events_retention)
+                if purged:
+                    log.info("historico: %d evento(s) com mais de %d dias removidos", purged, self.events_retention)
+        except (sqlite3.Error, OSError) as e:
+            log.error("historico desativado: nao foi possivel abrir %s: %s", self.events_db, e)
+            self.events = None
+        return self.events
+
+    def record(self, rows):
+        """Grava eventos [(ts, tipo, ip, jail, origem)] sem nunca derrubar o agente."""
+        if self.events is None or not rows:
+            return
+        try:
+            self.events.add_many(rows)
+        except sqlite3.Error as e:
+            self._report_error("eventos", "falha ao gravar o historico em %s: %s" % (self.events_db, e))
+
+    def _record_diff(self, before, after, add_kind, del_kind, source, now=None):
+        """Registra o que entrou e saiu entre dois estados {ip: jails}."""
+        now = now or int(time.time())
+        rows = [(now, add_kind, k, ",".join(sorted(after[k])) or source, source) for k in after if k not in before]
+        rows += [(now, del_kind, k, ",".join(sorted(before[k])) or source, source) for k in before if k not in after]
+        self.record(rows)
 
     def describe_routers(self):
         return ", ".join("%s (%s:%s%s)" % (r["name"], r["host"], r["port"], "" if r["enabled"] else ", desabilitado")
@@ -552,6 +674,7 @@ class Agent:
                 self._log_ignored(raw, "IPv6 desabilitado na configuracao")
                 continue
             desired[str(ip)] = (ip, jails)
+        self._last_f2b = {k: jails for k, (_ip, jails) in desired.items()}
         return desired
 
     def _log_ignored(self, ip, why):
@@ -747,23 +870,37 @@ class Agent:
         signal.signal(signal.SIGTERM, on_signal)
         signal.signal(signal.SIGINT, on_signal)
 
+        # o log passa a ser acompanhado antes da importacao do historico: nada escrito durante ela se perde
         watcher = LogWatcher(self.f2b_log) if self.f2b_log else None
+        self.open_events(import_history=True)
         bl_sig = file_signature(self.blacklist_file) if self.blacklist_file else None
+        bl_snapshot = self._blacklist_snapshot()
+        f2b_snapshot = None  # so usado sem log do fail2ban: eventos deduzidos entre sincronizacoes
         next_sync = 0.0
         pending_since = last_event = None
+        labels = {"ban": "Ban", "unban": "Unban", "restore": "Restore Ban"}
 
         while not self._stop:
             now = time.monotonic()
             changed = False
             if watcher is not None:
-                for action, jail, ip in watcher.poll():
-                    log.info("fail2ban: [%s] %s %s", jail, action, ip)
+                rows = []
+                for ts, kind, jail, ip in watcher.poll():
+                    log.info("fail2ban: [%s] %s %s", jail, labels[kind], ip)
+                    key = normalize_ip(ip)
+                    rows.append((ts, kind, str(key) if key is not None else ip, jail, "fail2ban"))
                     changed = True
+                self.record(rows)
             if self.blacklist_file:
                 sig = file_signature(self.blacklist_file)
                 if sig != bl_sig:
                     log.info("blacklist %s alterada", self.blacklist_file)
                     bl_sig, changed = sig, True
+                    snapshot = self._blacklist_snapshot()
+                    if snapshot is not None and bl_snapshot is not None:
+                        self._record_diff(bl_snapshot, snapshot, "bl-add", "bl-del", BLACKLIST_TAG)
+                    if snapshot is not None:
+                        bl_snapshot = snapshot
             if self.reload_routers():
                 changed = True
             if changed:
@@ -778,9 +915,21 @@ class Agent:
                 pending_since = last_event = None
                 ok = self.safe_sync(reason)
                 next_sync = time.monotonic() + (self.sync_interval if ok else self.retry_delay)
+                if watcher is None and self._last_f2b is not None:
+                    if f2b_snapshot is not None:
+                        self._record_diff(f2b_snapshot, self._last_f2b, "ban", "unban", "fail2ban")
+                    f2b_snapshot = self._last_f2b
 
             time.sleep(0.5)
         log.info("agente finalizado")
+
+    def _blacklist_snapshot(self):
+        if not self.blacklist_file:
+            return {}
+        try:
+            return {k: set() for k in self._blacklist()}
+        except BlacklistError:
+            return None
 
 
 # --------------------------------------------------------------------------- #
@@ -795,9 +944,10 @@ DEFAULTS = {
     "agent": {"sync_interval": "60", "debounce": "2", "retry_delay": "15",
               "logfile": "/var/log/f2b-mikrotik.log", "log_level": "INFO",
               "log_max_bytes": "10485760", "log_backups": "5", "lockfile": "/run/f2b-mikrotik.lock",
-              "routers_file": "/etc/f2b-mikrotik/routers.json"},
+              "routers_file": "/etc/f2b-mikrotik/routers.json",
+              "events_db": "/var/lib/f2b-mikrotik/events.db", "events_retention_days": "365"},
     "web": {"bind": "0.0.0.0", "port": "8088", "username": "admin", "password": "",
-            "tls_cert": "", "tls_key": ""},
+            "tls_cert": "", "tls_key": "", "geoip": "yes", "geo_file": "/var/lib/f2b-mikrotik/geo.tsv.gz"},
 }
 
 

@@ -52,6 +52,11 @@ log_backups = 5
 lockfile = /run/f2b-mikrotik.lock
 ; roteadores adicionais cadastrados pelo painel (relido sozinho quando muda)
 routers_file = /etc/f2b-mikrotik/routers.json
+; historico de bloqueios/desbloqueios (contagens e estatisticas do painel). Vazio = desativado.
+; Na primeira execucao importa o que ainda estiver no fail2ban.log e nos logs rotacionados.
+events_db = /var/lib/f2b-mikrotik/events.db
+; eventos mais antigos que isso sao apagados (0 = guardar tudo)
+events_retention_days = 365
 
 [web]
 ; painel web (f2b_web.py). Use 127.0.0.1 para aceitar so acessos locais.
@@ -63,3 +68,8 @@ password =
 ; HTTPS opcional (recomendado fora da rede interna): caminhos do certificado e da chave
 tls_cert =
 tls_key =
+; pais de origem dos IPs, pelas tabelas publicas dos registros regionais (ARIN, RIPE, LACNIC,
+; APNIC, AFRINIC). O painel baixa ~45 MB uma vez por semana e consulta tudo localmente:
+; nenhum IP e enviado a terceiros. no = sem pais (aparece "desconhecido").
+geoip = yes
+geo_file = /var/lib/f2b-mikrotik/geo.tsv.gz
