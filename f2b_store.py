@@ -41,7 +41,23 @@ SETTINGS = {
     "geo_provider": ("choice", "rir", ("rir", "ipinfo"), None, "fonte do pais"),
     "ipinfo_token": ("secret", "", None, None, "token do ipinfo Lite"),
     "geo_cache_days": ("int", 30, 1, 365, "dias de cache do ipinfo"),
+    "router_hold": ("duration", "", None, None,
+                    "retencao no MikroTik depois que o fail2ban libera (ex.: 7d; vazio = segue o fail2ban)"),
+    "router_hold_increment": ("bool", False, None, None, "dobrar a retencao a cada reincidencia (em 30 dias)"),
+    "router_hold_max": ("duration", "90d", None, None, "retencao maxima com reincidencia"),
 }
+HOLD_WINDOW = 30 * 86400  # reincidencia: nova liberacao ate 30 dias depois da anterior
+DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+
+
+def parse_duration(text):
+    """'7d', '1d12h', '90m' -> segundos; vazio/'0' -> 0."""
+    text = str(text or "").strip().lower()
+    if not text or text == "0":
+        return 0
+    if not DURATION_RE.match(text):
+        raise ValueError("duracao invalida: %r" % text)
+    return sum(int(n) * DURATION_UNITS[u] for n, u in re.findall(r"(\d+)([smhdw])", text))
 SECRET_MASK = "********"
 DURATION_RE = re.compile(r"^(\d+[smhdw])+$")
 HOST_RE = re.compile(r"^[A-Za-z0-9.:\-\[\]]{1,253}$")
@@ -126,6 +142,10 @@ class ConfigStore:
                 target TEXT NOT NULL DEFAULT '', details TEXT NOT NULL DEFAULT '');
             CREATE INDEX IF NOT EXISTS audit_ts ON audit (ts);
             CREATE INDEX IF NOT EXISTS audit_actor ON audit (actor);
+            CREATE TABLE IF NOT EXISTS holds (ip TEXT PRIMARY KEY, jails TEXT NOT NULL DEFAULT '',
+                first_at INTEGER, last_unban INTEGER, cycles INTEGER NOT NULL DEFAULT 0, release_at INTEGER,
+                ended INTEGER NOT NULL DEFAULT 1, released_by TEXT, released_at INTEGER, skip_until INTEGER);
+            CREATE INDEX IF NOT EXISTS holds_release ON holds (ended, release_at);
         """)
 
     # -- infraestrutura -------------------------------------------------------------
@@ -381,6 +401,93 @@ class ConfigStore:
             except StoreError:
                 pass
         return expired
+
+    # -- retencao no MikroTik depois do unban do fail2ban ------------------------------
+    @staticmethod
+    def hold_duration(settings, cycles):
+        base = parse_duration(settings.get("router_hold"))
+        if not base:
+            return 0
+        if not settings.get("router_hold_increment"):
+            return base
+        cap = parse_duration(settings.get("router_hold_max")) or base
+        return min(base * (2 ** max(0, cycles - 1)), max(cap, base))
+
+    def hold_unbanned(self, ip, jails, ts, settings):
+        """O fail2ban liberou `ip` em `ts`: retem no MikroTik. Retorna a linha da retencao, ou None se
+        nao houve retencao (desativada, liberacao pedida no painel ou evento repetido)."""
+        if not parse_duration(settings.get("router_hold")):
+            return None
+        with self._tx() as db:
+            row = db.execute("SELECT * FROM holds WHERE ip = ?", (ip,)).fetchone()
+            if row is not None and row["skip_until"] and row["skip_until"] >= ts:
+                db.execute("UPDATE holds SET skip_until = NULL WHERE ip = ?", (ip,))
+                return None  # desbanido no painel: libera tudo, sem retencao
+            recent = row is not None and row["last_unban"] and ts - row["last_unban"] <= HOLD_WINDOW
+            cycles = (row["cycles"] + 1) if recent else 1
+            release = ts + self.hold_duration(settings, cycles)
+            if row is not None and not row["ended"] and row["release_at"] and row["release_at"] > release:
+                release = row["release_at"]  # nunca encurta uma retencao em andamento
+            names = sorted(set(filter(None, (row["jails"].split(",") if row else []) + str(jails or "").split(","))))
+            if row is None:
+                db.execute("INSERT INTO holds (ip, jails, first_at, last_unban, cycles, release_at, ended) "
+                           "VALUES (?, ?, ?, ?, ?, ?, 0)", (ip, ",".join(names), ts, ts, cycles, release))
+            else:
+                db.execute("UPDATE holds SET jails=?, last_unban=?, cycles=?, release_at=?, ended=0, "
+                           "released_by=NULL, released_at=NULL WHERE ip=?",
+                           (",".join(names), ts, cycles, release, ip))
+        self.audit("agente", "retencao.iniciada", ip,
+                   {"jails": ",".join(names), "ate": time.strftime("%Y-%m-%d %H:%M", time.localtime(release)),
+                    "reincidencia": cycles})
+        return {"ip": ip, "release_at": release, "cycles": cycles, "jails": ",".join(names)}
+
+    def holds_active(self):
+        return self.query("SELECT * FROM holds WHERE ended = 0 AND release_at > ? ORDER BY release_at", (now(),))
+
+    def hold_skip(self, ip, seconds=180):
+        """O painel vai desbanir `ip`: a proxima liberacao do fail2ban nao gera retencao."""
+        with self._tx() as db:  # sem ON CONFLICT: funciona tambem com SQLite antigo (< 3.24)
+            if db.execute("SELECT 1 FROM holds WHERE ip = ?", (ip,)).fetchone():
+                db.execute("UPDATE holds SET skip_until = ? WHERE ip = ?", (now() + seconds, ip))
+            else:
+                db.execute("INSERT INTO holds (ip, skip_until) VALUES (?, ?)", (ip, now() + seconds))
+
+    def hold_release(self, ip, actor, ip_addr="", reason=None):
+        """Libera agora uma retencao em andamento. Retorna True se havia uma."""
+        with self._tx() as db:
+            row = db.execute("SELECT * FROM holds WHERE ip = ? AND ended = 0 AND release_at > ?", (ip, now())).fetchone()
+            if row is None:
+                return False
+            db.execute("UPDATE holds SET ended=1, released_by=?, released_at=? WHERE ip=?", (actor, now(), ip))
+        self.audit(actor, "retencao.liberada", ip,
+                   dict({"previsto": time.strftime("%Y-%m-%d %H:%M", time.localtime(row["release_at"]))},
+                        **({"motivo": reason} if reason else {})), ip_addr)
+        return True
+
+    def end_active_holds(self, actor, ip_addr="", reason=""):
+        """Encerra todas as retencoes em andamento (ex.: retencao desligada). Retorna os IPs."""
+        rows = self.query("SELECT ip FROM holds WHERE ended = 0")
+        if not rows:
+            return []
+        for r in rows:
+            self.hold_release(r["ip"], actor, ip_addr, reason)
+        with self._tx() as db:  # inclui as que ja tinham vencido e ainda nao foram marcadas
+            db.execute("UPDATE holds SET ended = 1 WHERE ended = 0")
+        return [r["ip"] for r in rows]
+
+    def expire_holds(self, actor="agente"):
+        """Marca como encerradas as retencoes vencidas. Retorna as encerradas."""
+        rows = self.query("SELECT * FROM holds WHERE ended = 0 AND release_at <= ?", (now(),))
+        for r in rows:
+            with self._tx() as db:
+                db.execute("UPDATE holds SET ended=1, released_by=?, released_at=? WHERE ip=? AND ended=0",
+                           (actor, now(), r["ip"]))
+            self.audit(actor, "retencao.expirada", r["ip"], {"jails": r["jails"], "reincidencia": r["cycles"]})
+        return rows
+
+    def next_hold_release(self):
+        rows = self.query("SELECT MIN(release_at) AS t FROM holds WHERE ended = 0 AND release_at > ?", (now(),))
+        return rows[0]["t"] if rows else None
 
     # -- usuarios -------------------------------------------------------------------
     def users(self):

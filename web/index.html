@@ -63,6 +63,7 @@
           <option value="fail2ban">fail2ban</option>
           <option value="blacklist">blacklist</option>
           <option value="router">só no roteador (manual)</option>
+          <option value="hold">retido no MikroTik</option>
         </select>
         <select id="entries-sort">
           <option value="ip">ordenar por IP</option>
@@ -164,6 +165,13 @@
             <label class="span-2">Jails replicadas<input name="jails" placeholder="vazio = todas (ex.: sshd, nginx-http-auth)"></label>
             <label class="check-inline span-2"><input type="checkbox" name="ipv6"> replicar também IPv6</label>
           </div>
+          <h2 class="mt">Retenção no MikroTik <span class="muted small">(bloqueio maior que o do fail2ban)</span></h2>
+          <p class="muted small">Quando o fail2ban libera um IP, o MikroTik continua bloqueando por mais este tempo. Desbanir pelo painel libera na hora, sem retenção.</p>
+          <div class="form-grid">
+            <label>Manter bloqueado por mais<input name="router_hold" class="mono" placeholder="vazio = desligado (ex.: 7d, 12h, 2w)"></label>
+            <label>Retenção máxima (reincidentes)<input name="router_hold_max" class="mono" placeholder="ex.: 90d"></label>
+            <label class="check-inline span-2"><input type="checkbox" name="router_hold_increment"> dobrar a retenção a cada reincidência (nova liberação em até 30 dias)</label>
+          </div>
           <h2 class="mt">Histórico e auditoria</h2>
           <div class="form-grid">
             <label>Dias de histórico de eventos<input name="events_retention_days" type="number" min="0" max="3650"></label>
@@ -221,6 +229,7 @@
           <option value="blacklist">blacklist</option>
           <option value="whitelist">whitelist</option>
           <option value="fail2ban">desbanimentos</option>
+          <option value="retencao">retenções no MikroTik</option>
           <option value="agente">agente (bloqueios nos roteadores)</option>
           <option value="acesso">acessos negados</option>
           <option value="sistema">sistema</option>

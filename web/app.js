@@ -151,6 +151,7 @@ function renderOverview() {
     [o.blacklist.ok ? o.blacklist.entries.length : "erro", "entradas na blacklist"],
     [`${online}/${enabled}`, "roteadores online"],
     [pending, "divergências (faltando + a remover)"],
+    ...(o.router_hold ? [[o.holds_count, `retidos no MikroTik (+${o.router_hold} após o fail2ban)`]] : []),
   ].map(([v, l]) => `<div class="stat"><div class="v">${esc(v)}</div><div class="l">${esc(l)}</div></div>`).join("");
 
   $("#router-cards").innerHTML = o.routers.map((r) => {
@@ -222,6 +223,7 @@ function renderEntries() {
     if (source === "fail2ban" && !e.jails.length) return false;
     if (source === "blacklist" && !e.blacklist) return false;
     if (source === "router" && e.sources.length) return false;
+    if (source === "hold" && !e.hold) return false;
     if (onlyDiff && !Object.values(e.routers).some((s) => s === "faltando" || s === "a remover")) return false;
     if (filter && !(e.key.toLowerCase().includes(filter) || e.sources.join(" ").toLowerCase().includes(filter))) return false;
     return true;
@@ -242,7 +244,8 @@ function renderEntries() {
         ${!e.sources.length ? '<div class="muted small">só no roteador</div>' : ""}</td>
       <td class="nowrap">${countryLabel(e.country)}</td>
       <td class="num" title="${e.last_block ? `último bloqueio: ${fmtTs(e.last_block)}` : "sem registro no histórico"}">${e.blocks || '<span class="muted">0</span>'}</td>
-      <td>${e.jails.map((j) => `<span class="pill">${esc(j)}</span>`).join(" ")}</td>
+      <td>${e.jails.map((j) => `<span class="pill">${esc(j)}</span>`).join(" ")}
+        ${e.hold ? `<span class="pill warn" title="o fail2ban já liberou; o MikroTik mantém o bloqueio (reincidência ${e.hold.cycles}, jail ${esc(e.hold.jails)})">retido até ${fmtTs(e.hold.release_at)}</span>` : ""}</td>
       <td>${e.blacklist ? '<span class="pill info">sim</span>' : ""}</td>
       ${routers.map((r) => `<td class="center">${stateBadge(e.routers[r.id])}</td>`).join("")}
       <td><div class="actions">${rowActions(e)}</div></td>
@@ -255,6 +258,7 @@ function rowActions(e) {
   if (!can("operador")) return "";
   const out = [];
   if (e.jails.length) out.push(`<button type="button" class="btn small" data-act="unban" data-ip="${esc(e.key)}">Desbanir</button>`);
+  else if (e.hold) out.push(`<button type="button" class="btn small" data-act="release" data-ip="${esc(e.key)}">Liberar no MikroTik</button>`);
   if (e.blacklist) out.push(`<button type="button" class="btn small" data-act="bl-del" data-entry="${esc(e.key)}">Tirar da blacklist</button>`);
   else if (!e.whitelisted) out.push(`<button type="button" class="btn small" data-act="bl-add" data-entry="${esc(e.key)}">+ Blacklist</button>`);
   return out.join("");
@@ -284,13 +288,26 @@ function refreshSoon() {
 async function doUnban(ip) {
   const e = overview && overview.entries.find((x) => x.key === ip);
   let msg = `Desbanir ${ip} no fail2ban${e && e.jails.length ? ` (jail: ${e.jails.join(", ")})` : ""}?\n\n`
-    + "O agente libera o IP nos MikroTiks em cerca de 2 segundos.";
+    + "O agente libera o IP nos MikroTiks em cerca de 2 segundos (desbanir pelo painel não aplica a retenção).";
   if (e && e.blacklist) msg += `\n\nAtenção: ${ip} também está na blacklist e continuará bloqueado nos roteadores.`;
   if (!confirm(msg)) return;
   const r = await api("/api/unban", { method: "POST", body: { ip } });
   toast(r.in_blacklist
     ? `${r.ip} desbanido de ${r.jails.join(", ")}, mas continua bloqueado pela blacklist.`
     : `${r.ip} desbanido de ${r.jails.join(", ")}. O agente está liberando nos MikroTiks…`, r.in_blacklist ? "warn" : "ok");
+  refreshSoon();
+}
+
+async function doRelease(ip) {
+  const e = overview && overview.entries.find((x) => x.key === ip);
+  const until = e && e.hold ? ` (retido até ${fmtTs(e.hold.release_at)})` : "";
+  if (!confirm(`Liberar ${ip} nos MikroTiks agora${until}?
+
+O fail2ban já tinha liberado este IP; o agente o remove dos roteadores em cerca de 2 segundos.`)) return;
+  const r = await api("/api/release", { method: "POST", body: { ip } });
+  if (r.in_blacklist) toast(`Retenção de ${r.ip} liberada, mas ele continua bloqueado pela blacklist.`, "warn");
+  else if (r.still_banned.length) toast(`Retenção de ${r.ip} liberada, mas ele voltou a ser banido no fail2ban (${r.still_banned.join(", ")}).`, "warn");
+  else toast(`${r.ip} liberado. O agente está removendo dos MikroTiks…`);
   refreshSoon();
 }
 
@@ -317,10 +334,11 @@ async function doBlacklistRemove(entry) {
 
 document.addEventListener("click", async (ev) => {
   const btn = ev.target.closest("[data-act]");
-  if (!btn || !["unban", "bl-add", "bl-del"].includes(btn.dataset.act)) return;
+  if (!btn || !["unban", "release", "bl-add", "bl-del"].includes(btn.dataset.act)) return;
   btn.disabled = true;
   try {
     if (btn.dataset.act === "unban") await doUnban(btn.dataset.ip);
+    if (btn.dataset.act === "release") await doRelease(btn.dataset.ip);
     if (btn.dataset.act === "bl-add") await doBlacklistAdd(btn.dataset.entry);
     if (btn.dataset.act === "bl-del") await doBlacklistRemove(btn.dataset.entry);
   } catch (e) {
@@ -381,6 +399,10 @@ function renderCheck(c) {
   facts.push(`País: ${c.is_network ? "da rede: " : ""}${countryLabel(ci.cc)}`
     + (geoSource ? ` <span class="muted small">(${geoSource})</span>` : "")
     + (ci.asn || ci.as_name ? ` · provedor: ${esc([ci.asn, ci.as_name].filter(Boolean).join(" "))}` : ""));
+  if (c.hold) {
+    facts.push(`<strong>Retido no MikroTik</strong> até ${fmtTs(c.hold.release_at)}: o fail2ban liberou em ${fmtTs(c.hold.last_unban)}`
+      + ` (jail ${esc(c.hold.jails)}${c.hold.cycles > 1 ? `, ${c.hold.cycles}ª reincidência` : ""}).`);
+  }
   const h = c.history;
   if (!c.meta.events) facts.push('<span class="muted">Histórico desativado no config.ini ([agent] events_db).</span>');
   else if (h.blocks || h.unblocks) {
@@ -424,6 +446,9 @@ function renderCheck(c) {
   }).join("");
 
   const actions = [];
+  if (can("operador") && c.hold && !c.fail2ban.matches.some((m) => m.relation === "igual")) {
+    actions.push(`<button type="button" class="btn" data-act="release" data-ip="${esc(c.query)}">Liberar no MikroTik</button>`);
+  }
   if (!can("operador")) { /* leitura: sem acoes */ } else if (c.fail2ban.matches.some((m) => m.relation === "igual")) {
     actions.push(`<button type="button" class="btn" data-act="unban" data-ip="${esc(c.query)}">Desbanir no fail2ban</button>`);
   }
@@ -831,7 +856,9 @@ sform.addEventListener("submit", async (ev) => {
   });
   try {
     const r = await api("/api/settings", { method: "PUT", body: { values } });
-    toast(r.changed.length ? `Configurações salvas: ${r.changed.join(", ")}. O agente aplica em ~2 s.` : "Nada mudou.");
+    toast(r.changed.length ? `Configurações salvas: ${r.changed.join(", ")}. O agente aplica em ~2 s.`
+      + (r.holds_released.length ? ` Retenção desligada: ${r.holds_released.length} IP(s) liberado(s) nos MikroTiks.` : "")
+      : "Nada mudou.");
     loadSettings();
   } catch (e) {
     toast(e.message, "bad");

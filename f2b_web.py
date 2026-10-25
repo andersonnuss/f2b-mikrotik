@@ -372,7 +372,13 @@ class Panel:
             items.append(dict(row, ignored=self._skip_reason(entry)))
         bl = {"ok": True, "error": None, "entries": sorted(blacklist, key=sort_key),
               "items": sorted(items, key=lambda i: sort_key(i["entry"]))}
-        return f2b, bl, per_jail, blacklist, a._merge(banned, blacklist)
+        return f2b, bl, per_jail, blacklist, a._merge(banned, blacklist, a._holds())
+
+    def holds(self):
+        """Retencoes ativas no MikroTik, por IP (vazio se a retencao estiver desligada)."""
+        if not f2b_store.parse_duration(self.agent.settings["router_hold"]):
+            return {}
+        return {r["ip"]: r for r in self.store.holds_active()}
 
     def _query_router(self, router):
         out = public_router(router)
@@ -413,7 +419,8 @@ class Panel:
                 f2b_ips.setdefault(str(ip) if ip is not None else raw, set()).add(jail)
         bl_networks = [e for e, _ in blacklist.values() if core.is_network(e)]
 
-        keys = set(desired) | set(f2b_ips)
+        holds = self.holds()
+        keys = set(desired) | set(f2b_ips) | set(holds)
         for r in routers:
             keys.update(row["key"] for row in r["rows"])
         counts = self.block_counts()
@@ -421,8 +428,11 @@ class Panel:
         for key in sorted(keys, key=sort_key):
             jails = sorted(f2b_ips.get(key, ()))
             entry = core.normalize_ip(key)
+            hold = holds.get(key)
             item = {"key": key, "jails": jails, "blacklist": key in blacklist, "expected": key in desired,
-                    "sources": jails + (["blacklist"] if key in blacklist else []), "note": "",
+                    "sources": jails + (["blacklist"] if key in blacklist else []) + (["retencao"] if hold else []),
+                    "hold": {"release_at": hold["release_at"], "cycles": hold["cycles"], "jails": hold["jails"]}
+                    if hold else None, "note": "",
                     "whitelisted": entry is not None and a._whitelisted(entry), "routers": {},
                     "blocks": counts.get(key, (0, None))[0], "last_block": counts.get(key, (0, None))[1],
                     "country": self.country(entry) if entry is not None else None}
@@ -466,6 +476,7 @@ class Panel:
         return {"generated_at": time.strftime("%Y-%m-%d %H:%M:%S"), "version": core.__version__,
                 "list_name": a.list_name, "families": a.families, "fail2ban": f2b, "blacklist": bl,
                 "whitelist": [str(n) for n in a.whitelist], "desired_count": len(desired),
+                "holds_count": len(holds), "router_hold": a.settings["router_hold"],
                 "routers": routers, "entries": entries, "agent_service": service_state("f2b-mikrotik"),
                 "meta": self.meta()}
 
@@ -483,7 +494,12 @@ class Panel:
                   "whitelist": [], "fail2ban": {"ok": f2b["ok"], "error": f2b["error"], "matches": []},
                   "blacklist": {"ok": bl["ok"], "error": bl["error"], "matches": []},
                   "desired": [], "routers": [], "country_info": self.country_info(target),
-                  "history": self.history(target), "meta": self.meta()}
+                  "history": self.history(target), "meta": self.meta(), "hold": None}
+        if not core.is_network(target):
+            hold = self.holds().get(str(target))
+            if hold:
+                result["hold"] = {"release_at": hold["release_at"], "cycles": hold["cycles"], "jails": hold["jails"],
+                                  "last_unban": hold["last_unban"]}
         for net in a.whitelist:
             rel = relation(target, net)
             if rel:
@@ -546,6 +562,11 @@ class Panel:
             per_jail = f2b.per_jail()
         except core.Fail2banError as e:
             raise ApiError(502, str(e))
+        matching = [(jail, raw) for jail, ips in sorted(per_jail.items()) if not jail_filter or jail == jail_filter
+                    for raw in ips if core.normalize_ip(raw) == target]
+        if matching:
+            # desbanir no painel libera de verdade: a liberacao do fail2ban nao gera retencao no MikroTik
+            self.store.hold_skip(str(target))
         done = []
         for jail, ips in sorted(per_jail.items()):
             if jail_filter and jail != jail_filter:
@@ -562,8 +583,28 @@ class Panel:
             raise ApiError(404, "%s nao esta banido %s" % (target, "na jail " + jail_filter if jail_filter
                                                               else "no fail2ban"))
         self.store.audit(who, "fail2ban.unban", str(target), {"jails": done}, ip)
+        self.store.hold_release(str(target), who, ip, "desbanido no painel")
+        self.refresh(force=True)
         in_blacklist = any(relation(target, e) in ("igual", "dentro") for e, _ in self.agent._blacklist().values())
         return {"ip": str(target), "jails": done, "in_blacklist": in_blacklist}
+
+    def release_hold(self, data, who, ip):
+        try:
+            target = ipaddress.ip_address(str(data.get("ip", "")).strip())
+        except ValueError:
+            raise ApiError(400, "informe um IP valido")
+        if not self.store.hold_release(str(target), who, ip, "liberado no painel"):
+            raise ApiError(404, "%s nao esta retido no MikroTik" % target)
+        self.refresh(force=True)
+        still = [jail for jail, ips in self._safe_per_jail().items() for raw in ips if core.normalize_ip(raw) == target]
+        in_blacklist = any(relation(target, e) in ("igual", "dentro") for e, _ in self.agent._blacklist().values())
+        return {"ip": str(target), "still_banned": still, "in_blacklist": in_blacklist}
+
+    def _safe_per_jail(self):
+        try:
+            return self.agent.f2b.per_jail()
+        except core.Fail2banError:
+            return {}
 
     def blacklist_add(self, data, who, ip):
         entry = core.normalize_ip(str(data.get("entry", "")).strip())
@@ -692,8 +733,12 @@ class Panel:
     def update_settings(self, data, who, ip):
         with self.write_lock:
             diff = self.store.update_settings(data.get("values") or {}, who, ip)
+            released = []
+            if "router_hold" in diff and not f2b_store.parse_duration(diff["router_hold"][1]):
+                # desligar a retencao libera os retidos (e eles nao voltam se ela for religada)
+                released = self.store.end_active_holds(who, ip, "retencao desligada nas configuracoes")
         self.refresh(force=True)
-        return {"changed": sorted(diff)}
+        return {"changed": sorted(diff), "holds_released": released}
 
 
 def _err(fn, *args, **kwargs):
@@ -892,6 +937,9 @@ class Handler(BaseHTTPRequestHandler):
     def h_unban(self, user, _q):
         return self._json(200, self.panel.unban(self._body(), user["username"], self.ip))
 
+    def h_release(self, user, _q):
+        return self._json(200, self.panel.release_hold(self._body(), user["username"], self.ip))
+
     def h_bl_add(self, user, _q):
         return self._json(201, _err(self.panel.blacklist_add, self._body(), user["username"], self.ip))
 
@@ -997,6 +1045,7 @@ ROUTES = [
     ("GET", r"/api/stats", "leitura", Handler.h_stats),
     ("GET", r"/api/log", "leitura", Handler.h_log),
     ("POST", r"/api/unban", "operador", Handler.h_unban),
+    ("POST", r"/api/release", "operador", Handler.h_release),
     ("POST", r"/api/blacklist", "operador", Handler.h_bl_add),
     ("DELETE", r"/api/blacklist", "operador", Handler.h_bl_del),
     ("POST", r"/api/whitelist", "admin", Handler.h_wl_add),

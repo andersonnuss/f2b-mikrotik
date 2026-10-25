@@ -53,7 +53,7 @@ import time
 
 import f2b_store
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 log = logging.getLogger("f2b-mikrotik")
 
@@ -418,6 +418,7 @@ class LogWatcher:
 # --------------------------------------------------------------------------- #
 LIST_PATHS = {4: "/ip/firewall/address-list", 6: "/ipv6/firewall/address-list"}
 BLACKLIST_TAG = "blacklist"
+HOLD_TAG = "retencao"
 
 
 class BlacklistError(Exception):
@@ -556,6 +557,8 @@ class Agent:
                             "Defina uma com: f2b_mikrotik.py --reset-password admin")
         self._data_version = None
         self._config_sig = None
+        self._hold_prev = None
+        self._unban_seen = set()
         self.reload(force=True)
 
     # -- configuracao do banco ------------------------------------------------------
@@ -569,7 +572,8 @@ class Agent:
         routers = self.store.routers()
         whitelist = [r["entry"] for r in self.store.whitelist()]
         blacklist = [(r["entry"], r["expires_at"]) for r in self.store.blacklist()]
-        sig = json.dumps([settings, routers, whitelist, blacklist], sort_keys=True, default=str)
+        holds = [(r["ip"], r["release_at"]) for r in self.store.holds_active()]  # liberacao manual no painel
+        sig = json.dumps([settings, routers, whitelist, blacklist, holds], sort_keys=True, default=str)
         if sig == self._config_sig:
             return False
         first = self._config_sig is None
@@ -664,30 +668,81 @@ class Agent:
         return result
 
     @staticmethod
-    def _merge(banned, blacklist):
+    def _merge(banned, blacklist, holds=None):
         desired = {k: (entry, set(tags)) for k, (entry, tags) in blacklist.items()}
         networks = [entry for entry, _ in blacklist.values() if is_network(entry)]
-        for key, (ip, jails) in banned.items():
+        individual = {k: (ip, set(tags)) for k, (ip, tags) in banned.items()}
+        for key, (ip, tags) in (holds or {}).items():  # retidos no MikroTik depois do unban do fail2ban
+            if key in individual:
+                individual[key][1].update(tags)
+            else:
+                individual[key] = (ip, set(tags))
+        for key, (ip, tags) in individual.items():
             if key in desired:
-                desired[key][1].update(jails)
+                desired[key][1].update(tags)
             elif not any(ip.version == net.version and ip in net for net in networks):
-                desired[key] = (ip, jails)  # IP dentro de uma rede da blacklist ja esta bloqueado
+                desired[key] = (ip, tags)  # IP dentro de uma rede da blacklist ja esta bloqueado
         return desired
+
+    def _holds(self):
+        """Retencoes ativas no MikroTik (IPs que o fail2ban ja liberou): {chave: (ip, {"retencao"})}."""
+        if not f2b_store.parse_duration(self.settings["router_hold"]):
+            return {}
+        result = {}
+        for row in self.store.holds_active():
+            ip = normalize_ip(row["ip"])
+            if ip is not None and not self._whitelisted(ip) and ip.version in self.families:
+                result[str(ip)] = (ip, {HOLD_TAG})
+        return result
+
+    def on_unban(self, key, jails, ts=None):
+        """O fail2ban liberou um IP: mantem bloqueado no MikroTik pelo periodo de retencao."""
+        if not f2b_store.parse_duration(self.settings["router_hold"]):
+            return None
+        entry = normalize_ip(key)
+        if entry is None or self._whitelisted(entry) or entry.version not in self.families:
+            return None
+        # uma liberacao por ciclo de ban: o log e a sincronizacao podem ver a mesma liberacao
+        if str(entry) in self._unban_seen:
+            return None
+        self._unban_seen.add(str(entry))
+        try:
+            hold = self.store.hold_unbanned(str(entry), jails, int(ts or time.time()), self.settings)
+        except sqlite3.Error as e:
+            self._report_error("banco", "falha ao registrar a retencao de %s: %s" % (key, e))
+            return None
+        if hold:
+            log.info("RETIDO no MikroTik: %s ate %s (o fail2ban liberou; reincidencia %d)", hold["ip"],
+                     time.strftime("%Y-%m-%d %H:%M", time.localtime(hold["release_at"])), hold["cycles"])
+        return hold
+
+    def _detect_unbans(self, banned):
+        """Deduz liberacoes do fail2ban entre duas sincronizacoes (sem log, ou evento perdido)."""
+        prev, self._hold_prev = self._hold_prev, {k: jails for k, (_ip, jails) in banned.items()}
+        self._unban_seen.difference_update(banned)  # banido de novo: a proxima liberacao conta
+        if prev is None:
+            return
+        for key in prev:
+            if key not in banned:
+                self.on_unban(key, ",".join(sorted(prev[key])))
 
     def _desired(self):
         """O que deve estar bloqueado nos roteadores: ({chave: (ip_ou_rede, origens)}, fail2ban_ok).
 
-        Se o fail2ban estiver fora do ar, aplica so a blacklist e sinaliza para nada ser removido."""
+        Se o fail2ban estiver fora do ar, aplica so a blacklist e as retencoes e sinaliza para nada
+        ser removido."""
         blacklist = self._blacklist()
         try:
             banned = self._from_fail2ban()
         except Fail2banError as e:
-            if not blacklist:
+            holds = self._holds()
+            if not blacklist and not holds:
                 raise
-            self._report_error("fontes", "fail2ban indisponivel; aplicando apenas a blacklist, "
+            self._report_error("fontes", "fail2ban indisponivel; aplicando apenas blacklist e retencoes, "
                                          "nada sera removido: %s" % e)
-            return blacklist, False
-        return self._merge(banned, blacklist), True
+            return self._merge({}, blacklist, holds), False
+        self._detect_unbans(banned)  # antes de ler as retencoes: um IP recem-liberado nao sai do roteador
+        return self._merge(banned, blacklist, self._holds()), True
 
     def _from_fail2ban(self, per_jail=None):
         """IPs banidos no fail2ban: {ip_str: (ip, jails)}."""
@@ -837,6 +892,9 @@ class Agent:
             self.store.path, len(self.routers), len(self.blacklist_entries), len(self.whitelist),
             len(self.store.users())))
         blacklist = self._blacklist()
+        hold_txt = self.settings["router_hold"]
+        print("retencao no MikroTik ... %s" % ("%s apos o unban do fail2ban, %d IP(s) retido(s) agora"
+                                                % (hold_txt, len(self._holds())) if hold_txt else "desativada"))
         if not self.routers:
             print("  nenhum roteador cadastrado: cadastre os MikroTiks no painel (aba Roteadores)")
             ok = False
@@ -845,7 +903,7 @@ class Agent:
             banned = self._from_fail2ban()
             print("OK - %d IP(s) banido(s) a replicar" % len(banned))
             if ok:
-                desired = self._merge(banned, blacklist)
+                desired = self._merge(banned, blacklist, self._holds())
         except Fail2banError as e:
             print("FALHOU: %s" % e)
             ok = False
@@ -923,13 +981,23 @@ class Agent:
                     log.info("fail2ban: [%s] %s %s", jail, labels[kind], ip)
                     key = normalize_ip(ip)
                     rows.append((ts, kind, str(key) if key is not None else ip, jail, "fail2ban"))
+                    if kind == "unban":
+                        self.on_unban(ip, jail, ts)  # retem no MikroTik antes de sincronizar
+                    else:
+                        self._unban_seen.discard(str(key) if key is not None else ip)  # novo ciclo de ban
                     changed = True
                 self.record(rows)
-            if now >= next_housekeeping:  # validade da blacklist e retencao da auditoria
-                next_housekeeping = now + 30
+            if now >= next_housekeeping:  # validades (blacklist e retencoes) e limpeza da auditoria
+                next_housekeeping = now + 15
                 try:
                     for row in self.store.expire_blacklist():
                         log.info("blacklist: %s expirou", row["entry"])
+                    for row in self.store.expire_holds():
+                        log.info("retencao de %s no MikroTik terminou", row["ip"])
+                        changed = True
+                    if not f2b_store.parse_duration(self.settings["router_hold"]):
+                        for ip_ in self.store.end_active_holds("agente", reason="retencao desligada"):
+                            log.info("retencao de %s encerrada: retencao desligada", ip_)
                     if now >= next_purge:
                         next_purge = now + 3600
                         self.store.audit_purge(int(self.settings["audit_retention_days"]))

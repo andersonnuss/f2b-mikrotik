@@ -17,7 +17,32 @@ Replica nos MikroTiks os IPs banidos e liberados pelo fail2ban, para que o bloqu
 O agente roda como daemon (systemd) e faz duas coisas:
 
 1. **Eventos:** acompanha o `fail2ban.log` (`Ban`, `Unban`, `Restore Ban`) e sincroniza ~2 s depois. Faz o mesmo quando algo muda no painel.
-2. **Reconciliação:** a cada 60 s (configurável), compara o que deveria estar bloqueado (fail2ban + blacklist − whitelist) com a address-list de **cada** roteador e corrige as diferenças. Por isso nada se perde se um roteador cair, o agente reiniciar ou o log rotacionar.
+2. **Reconciliação:** a cada 60 s (configurável), compara o que deveria estar bloqueado (fail2ban + blacklist + retenções − whitelist) com a address-list de **cada** roteador e corrige as diferenças. Por isso nada se perde se um roteador cair, o agente reiniciar ou o log rotacionar.
+
+## Retenção no MikroTik (bloqueio maior que o do fail2ban)
+
+A liberação nos MikroTiks tem um controle próprio, paralelo ao do fail2ban: quando o fail2ban **libera** um IP, seja porque o ban venceu, seja por um `unban`, o MikroTik continua bloqueando esse IP por mais um tempo, que você define. Assim o servidor pode usar bans curtos, que perdoam rápido um usuário legítimo, enquanto a borda segura o atacante por mais tempo.
+
+Configure em **Configurações → Retenção no MikroTik**:
+
+| Opção | Exemplo | Efeito |
+|---|---|---|
+| Manter bloqueado por mais | `7d` | depois que o fail2ban libera, o IP fica mais 7 dias bloqueado nos MikroTiks. Vazio desliga a retenção. |
+| Dobrar a cada reincidência | ✓ | se o mesmo IP for liberado de novo em até 30 dias, a retenção dobra: 7d, 14d, 28d… |
+| Retenção máxima | `90d` | limite da retenção dobrada |
+
+As durações usam `s`, `m`, `h`, `d` e `w`, e podem ser combinadas: `1d12h`, `2w`.
+
+Como a retenção funciona:
+- **Contagem:** começa no momento em que o fail2ban libera o IP, e não no ban. Por isso é sempre um bloqueio **a mais**, qualquer que seja o `bantime` do fail2ban.
+- **Detecção:** a liberação é percebida pelo log do fail2ban ou, sem ele, comparando duas sincronizações. Em ambos os casos o IP é retido antes de sincronizar, então ele **nunca sai do roteador**, nem por um instante.
+- **Na tela:** a tabela da visão geral mostra **"retido até dd/mm hh:mm"**. O filtro "retido no MikroTik" lista só esses IPs, e a consulta de IP informa quando o fail2ban liberou e até quando dura a retenção.
+- **Liberação manual:** o botão **Liberar no MikroTik** (operador ou administrador) encerra a retenção na hora.
+- **Desbanir pelo painel:** libera de verdade. Tira o IP do fail2ban e dos MikroTiks **sem** aplicar retenção.
+- **Vencimento:** quando a retenção termina, o agente libera o IP nos roteadores sozinho.
+- **Desligar:** apagar o tempo de retenção encerra todas as retenções em andamento. Elas não voltam se a retenção for religada.
+- **Whitelist e reinício do fail2ban:** IPs da whitelist nunca são retidos. Ao **parar** o fail2ban, ele libera todos os IPs, e com a retenção ligada todos ficam retidos, o que evita uma janela sem bloqueio durante o reinício.
+- **Auditoria:** registra `retencao.iniciada`, `retencao.liberada` (com usuário e motivo) e `retencao.expirada`.
 
 ### Garantias de segurança
 
@@ -83,7 +108,7 @@ Roda na porta **8088**, sem Node e sem dependências. O login é por sessão: o 
 | | leitura | operador | administrador |
 |---|:-:|:-:|:-:|
 | Visão geral, consulta de IP, estatísticas, log do agente | ✓ | ✓ | ✓ |
-| Desbanir IP no fail2ban | | ✓ | ✓ |
+| Desbanir IP no fail2ban, liberar retenção no MikroTik | | ✓ | ✓ |
 | Incluir e remover da blacklist | | ✓ | ✓ |
 | Whitelist, roteadores, configurações | | | ✓ |
 | Usuários e auditoria | | | ✓ |
@@ -96,7 +121,7 @@ Cada usuário pode **trocar a própria senha**, e ao trocá-la suas outras sess�
 - **Visão geral:** o estado de cada roteador e a tabela única de bloqueios, com fail2ban, blacklist e cada MikroTik, mais país e quantidade de bloqueios. Tem também a blacklist, com o formulário para incluir.
 - **Estatísticas:** bloqueios e desbloqueios por hora, IPs mais bloqueados, bloqueios por país e por jail, e os últimos eventos.
 - **Roteadores:** cadastrar, editar, testar a conexão e excluir MikroTiks. Todos recebem os mesmos bloqueios.
-- **Configurações:** intervalos, validade da entrada no roteador, jails replicadas, IPv6, retenção do histórico e da auditoria, fonte do país (RIRs ou ipinfo) e token do ipinfo. Também a **whitelist**, com inclusão e remoção.
+- **Configurações:** intervalos, validade da entrada no roteador, jails replicadas, IPv6, **retenção no MikroTik**, retenção do histórico e da auditoria, fonte do país (RIRs ou ipinfo) e token do ipinfo. Também a **whitelist**, com inclusão e remoção.
 - **Usuários:** cadastrar, editar (papel, nome, ativo, nova senha) e excluir usuários.
 - **Auditoria:** a trilha completa, com filtros por usuário, tipo de ação, texto e período, e exportação em **CSV**.
 - **Log do agente:** as últimas linhas do `/var/log/f2b-mikrotik.log`.
@@ -126,7 +151,7 @@ Tudo fica registrado com data e hora, usuário, IP de origem, ação, alvo e det
 | Configuração | `config.alterada` (valor antigo → novo; o token aparece como `********`) |
 | Roteadores | `roteador.criado` / `alterado` / `removido` / `limpeza_falhou` |
 | Listas | `blacklist.incluido` / `removido` / `expirado`, `whitelist.incluido` / `removido` |
-| Operação | `fail2ban.unban`, `auditoria.exportada` |
+| Operação | `fail2ban.unban`, `retencao.iniciada` / `liberada` / `expirada`, `auditoria.exportada` |
 | Agente | `agente.bloqueio` / `liberacao` (por roteador), `agente.erro`, `agente.iniciado` / `encerrado` |
 | Sistema | `sistema.migracao`, `painel.iniciado` |
 
@@ -178,6 +203,8 @@ tail -f /var/log/f2b-mikrotik.log
 2026-10-24 17:58:15 [INFO] fail2ban: [sshd] Ban 203.0.113.77
 2026-10-24 17:58:16 [INFO] BLOQUEADO no MikroTik [sede]: 203.0.113.77 (jail: sshd)
 2026-10-24 17:58:16 [INFO] BLOQUEADO no MikroTik [filial]: 203.0.113.77 (jail: sshd)
+2026-10-24 18:58:15 [INFO] fail2ban: [sshd] Unban 203.0.113.77
+2026-10-24 18:58:15 [INFO] RETIDO no MikroTik: 203.0.113.77 ate 2026-10-31 18:58 (o fail2ban liberou; reincidencia 1)
 2026-10-24 18:02:40 [INFO] configuracao atualizada pelo painel; roteadores: sede (...), filial (...), loja (...)
 2026-10-24 18:40:00 [ERROR] falha ao comunicar com o MikroTik [filial] 10.0.0.1:8728: timed out (nova tentativa em 15s)
 ```
