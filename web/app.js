@@ -144,7 +144,6 @@ function renderOverview() {
   const enabled = o.routers.filter((r) => r.enabled).length;
   const banned = new Set();
   o.fail2ban.jails.forEach((j) => j.ips.forEach((ip) => banned.add(ip)));
-  const pending = o.routers.reduce((n, r) => n + (r.missing || []).length + (r.extra || []).length, 0);
   // o que esta de fato na address-list (ativo) de pelo menos um roteador online, sem repetir
   const onRouter = o.entries.filter((e) => Object.values(e.routers)
     .some((s) => s === "agente" || s === "a remover" || s === "manual")).length;
@@ -153,7 +152,6 @@ function renderOverview() {
     [o.fail2ban.ok ? banned.size : "erro", "IPs banidos no fail2ban"],
     [o.blacklist.ok ? o.blacklist.entries.length : "erro", "entradas na blacklist"],
     [`${online}/${enabled}`, "roteadores online"],
-    [pending, "divergências (faltando + a remover)"],
     ...(o.router_hold ? [[o.holds_count, `retidos no MikroTik (+${o.router_hold} após o fail2ban)`]] : []),
   ].map(([v, l]) => `<div class="stat"><div class="v">${esc(v)}</div><div class="l">${esc(l)}</div></div>`).join("");
 
