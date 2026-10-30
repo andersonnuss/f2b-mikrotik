@@ -145,8 +145,11 @@ function renderOverview() {
   const banned = new Set();
   o.fail2ban.jails.forEach((j) => j.ips.forEach((ip) => banned.add(ip)));
   const pending = o.routers.reduce((n, r) => n + (r.missing || []).length + (r.extra || []).length, 0);
+  // o que esta de fato na address-list (ativo) de pelo menos um roteador online, sem repetir
+  const onRouter = o.entries.filter((e) => Object.values(e.routers)
+    .some((s) => s === "agente" || s === "a remover" || s === "manual")).length;
   $("#stats").innerHTML = [
-    [o.desired_count, "a bloquear (fail2ban + blacklist)"],
+    [online ? onRouter : "—", "bloqueados no MikroTik"],
     [o.fail2ban.ok ? banned.size : "erro", "IPs banidos no fail2ban"],
     [o.blacklist.ok ? o.blacklist.entries.length : "erro", "entradas na blacklist"],
     [`${online}/${enabled}`, "roteadores online"],
