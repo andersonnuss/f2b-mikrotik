@@ -90,6 +90,12 @@ function fmtTs(ts, withDate = true) {
   const hm = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
   return withDate ? `${pad(d.getDate())}/${pad(d.getMonth() + 1)} ${hm}` : hm;
 }
+
+// data completa (com ano): bloqueios antigos, como os da blacklist permanente, podem ser de outro ano
+function fmtDateTime(ts) {
+  const d = new Date(ts * 1000);
+  return `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
 const KIND_LABEL = { ban: "bloqueio (fail2ban)", unban: "desbloqueio (fail2ban)", restore: "restaurado",
   "bl-add": "incluído na blacklist", "bl-del": "removido da blacklist" };
 const KIND_CLASS = { ban: "st-bad", "bl-add": "st-bad", unban: "st-ok", "bl-del": "st-ok", restore: "st-muted" };
@@ -243,7 +249,7 @@ function renderEntries() {
 
   $("#count-entries").textContent = overview.entries.length;
   $("#entries-info").textContent = `${rows.length} de ${overview.entries.length}`;
-  const head = `<thead><tr><th>IP / rede</th><th>país</th>${showProvider ? "<th>provedor</th>" : ""}<th class="num" title="quantas vezes foi bloqueado (histórico)">bloqueios</th><th>fail2ban</th><th>blacklist</th>
+  const head = `<thead><tr><th>IP / rede</th><th>país</th>${showProvider ? "<th>provedor</th>" : ""}<th class="num" title="quantas vezes foi bloqueado (histórico)">bloqueios</th><th title="data e hora do último bloqueio (histórico)">bloqueado em</th><th>fail2ban</th><th>blacklist</th>
     ${routers.map((r) => `<th class="center">${esc(r.name)}</th>`).join("")}<th></th></tr></thead>`;
   const body = rows.length ? rows.slice(0, 3000).map((e) => `<tr>
       <td><button type="button" class="link mono" data-check="${esc(e.key)}">${esc(e.key)}</button>
@@ -253,13 +259,14 @@ function renderEntries() {
       ${showProvider ? `<td class="provider small" title="${esc([e.asn, e.as_name].filter(Boolean).join(" "))}">${e.as_name
         ? esc(e.as_name) : (e.asn ? esc(e.asn) : '<span class="muted">—</span>')}</td>` : ""}
       <td class="num" title="${e.last_block ? `último bloqueio: ${fmtTs(e.last_block)}` : "sem registro no histórico"}">${e.blocks || '<span class="muted">0</span>'}</td>
+      <td class="nowrap small">${e.last_block ? fmtDateTime(e.last_block) : '<span class="muted" title="sem registro no histórico">—</span>'}</td>
       <td>${e.jails.map((j) => `<span class="pill">${esc(j)}</span>`).join(" ")}
         ${e.hold ? `<span class="pill warn" title="o fail2ban já liberou; o MikroTik mantém o bloqueio (reincidência ${e.hold.cycles}, jail ${esc(e.hold.jails)})">retido até ${fmtTs(e.hold.release_at)}</span>` : ""}</td>
       <td>${e.blacklist ? '<span class="pill info">sim</span>' : ""}</td>
       ${routers.map((r) => `<td class="center">${stateBadge(e.routers[r.id])}</td>`).join("")}
       <td><div class="actions">${rowActions(e)}</div></td>
     </tr>`).join("")
-    : `<tr><td colspan="${routers.length + 6 + (showProvider ? 1 : 0)}" class="empty">nada encontrado</td></tr>`;
+    : `<tr><td colspan="${routers.length + 7 + (showProvider ? 1 : 0)}" class="empty">nada encontrado</td></tr>`;
   $("#entries-table").innerHTML = head + `<tbody>${body}</tbody>`;
 }
 
