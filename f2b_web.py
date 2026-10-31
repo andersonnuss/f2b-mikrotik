@@ -429,13 +429,14 @@ class Panel:
             jails = sorted(f2b_ips.get(key, ()))
             entry = core.normalize_ip(key)
             hold = holds.get(key)
+            geo = self.country_info(entry) if entry is not None else {}  # so le o cache do ipinfo
             item = {"key": key, "jails": jails, "blacklist": key in blacklist, "expected": key in desired,
                     "sources": jails + (["blacklist"] if key in blacklist else []) + (["retencao"] if hold else []),
                     "hold": {"release_at": hold["release_at"], "cycles": hold["cycles"], "jails": hold["jails"]}
                     if hold else None, "note": "",
                     "whitelisted": entry is not None and a._whitelisted(entry), "routers": {},
                     "blocks": counts.get(key, (0, None))[0], "last_block": counts.get(key, (0, None))[1],
-                    "country": self.country(entry) if entry is not None else None}
+                    "country": geo.get("cc"), "asn": geo.get("asn", ""), "as_name": geo.get("as_name", "")}
             if jails and key not in desired:
                 cover = next((n for n in bl_networks if entry is not None and entry.version == n.version
                               and entry in n), None)

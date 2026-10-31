@@ -40,7 +40,7 @@ SETTINGS = {
     "geoip": ("bool", True, None, None, "pais pelas tabelas dos RIRs"),
     "geo_provider": ("choice", "rir", ("rir", "ipinfo"), None, "fonte do pais"),
     "ipinfo_token": ("secret", "", None, None, "token do ipinfo Lite"),
-    "geo_cache_days": ("int", 30, 1, 365, "dias de cache do ipinfo"),
+    "geo_cache_days": ("int", 180, 1, 365, "dias de cache do ipinfo"),
     "router_hold": ("duration", "", None, None,
                     "retencao no MikroTik depois que o fail2ban libera (ex.: 7d; vazio = segue o fail2ban)"),
     "router_hold_increment": ("bool", False, None, None, "dobrar a retencao a cada reincidencia (em 30 dias)"),

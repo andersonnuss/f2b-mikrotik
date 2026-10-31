@@ -1056,7 +1056,7 @@ DEFAULTS = {
               "events_db": "/var/lib/f2b-mikrotik/events.db", "events_retention_days": "365"},
     "web": {"bind": "0.0.0.0", "port": "8088", "username": "admin", "password": "",
             "tls_cert": "", "tls_key": "", "geoip": "yes", "geo_file": "/var/lib/f2b-mikrotik/geo.tsv.gz",
-            "geo_provider": "rir", "ipinfo_token": "", "geo_cache_days": "30", "ipinfo_url": ""},
+            "geo_provider": "rir", "ipinfo_token": "", "geo_cache_days": "180","ipinfo_url": ""},
 }
 
 

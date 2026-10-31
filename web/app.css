@@ -266,6 +266,7 @@ dialog::backdrop { background: rgba(0, 0, 0, .45); }
 .hbar-value { font-variant-numeric: tabular-nums; white-space: nowrap; }
 .table .num, .table th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .nowrap { white-space: nowrap; }
+.provider { max-width: 220px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 details.history { margin-top: 4px; }
 details.history ul { margin: 4px 0 0; padding-left: 16px; }
 @media (max-width: 640px) {

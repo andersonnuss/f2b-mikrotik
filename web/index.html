@@ -57,7 +57,7 @@
 
       <h2>Bloqueios: fail2ban, blacklist e MikroTik <span class="count" id="count-entries"></span></h2>
       <div class="toolbar">
-        <input id="entries-filter" class="mono" placeholder="filtrar IP, rede ou jail" spellcheck="false">
+        <input id="entries-filter" class="mono" placeholder="filtrar IP, rede, jail ou provedor" spellcheck="false">
         <select id="entries-source">
           <option value="">todas as origens</option>
           <option value="fail2ban">fail2ban</option>
@@ -70,6 +70,7 @@
           <option value="blocks">mais bloqueados</option>
           <option value="recent">bloqueio mais recente</option>
           <option value="country">país</option>
+          <option value="provider">provedor</option>
         </select>
         <label class="check-inline"><input type="checkbox" id="entries-diff"> só divergências</label>
         <span class="muted small" id="entries-info"></span>

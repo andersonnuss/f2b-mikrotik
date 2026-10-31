@@ -226,7 +226,8 @@ function renderEntries() {
     if (source === "router" && e.sources.length) return false;
     if (source === "hold" && !e.hold) return false;
     if (onlyDiff && !Object.values(e.routers).some((s) => s === "faltando" || s === "a remover")) return false;
-    if (filter && !(e.key.toLowerCase().includes(filter) || e.sources.join(" ").toLowerCase().includes(filter))) return false;
+    if (filter && !(e.key.toLowerCase().includes(filter) || e.sources.join(" ").toLowerCase().includes(filter)
+      || `${e.asn} ${e.as_name}`.toLowerCase().includes(filter))) return false;
     return true;
   });
 
@@ -234,16 +235,23 @@ function renderEntries() {
   if (sort === "blocks") rows.sort((a, b) => b.blocks - a.blocks || (b.last_block || 0) - (a.last_block || 0));
   if (sort === "recent") rows.sort((a, b) => (b.last_block || 0) - (a.last_block || 0));
   if (sort === "country") rows.sort((a, b) => countryName(a.country).localeCompare(countryName(b.country), "pt-BR") || b.blocks - a.blocks);
+  // sem provedor conhecido vai para o fim
+  if (sort === "provider") rows.sort((a, b) => (!a.as_name - !b.as_name)
+    || a.as_name.localeCompare(b.as_name, "pt-BR") || b.blocks - a.blocks);
+  // a coluna so aparece com o ipinfo ligado (ou com dados dele ainda no cache)
+  const showProvider = overview.meta.geo_provider === "ipinfo" || overview.entries.some((e) => e.as_name || e.asn);
 
   $("#count-entries").textContent = overview.entries.length;
   $("#entries-info").textContent = `${rows.length} de ${overview.entries.length}`;
-  const head = `<thead><tr><th>IP / rede</th><th>país</th><th class="num" title="quantas vezes foi bloqueado (histórico)">bloqueios</th><th>fail2ban</th><th>blacklist</th>
+  const head = `<thead><tr><th>IP / rede</th><th>país</th>${showProvider ? "<th>provedor</th>" : ""}<th class="num" title="quantas vezes foi bloqueado (histórico)">bloqueios</th><th>fail2ban</th><th>blacklist</th>
     ${routers.map((r) => `<th class="center">${esc(r.name)}</th>`).join("")}<th></th></tr></thead>`;
   const body = rows.length ? rows.slice(0, 3000).map((e) => `<tr>
       <td><button type="button" class="link mono" data-check="${esc(e.key)}">${esc(e.key)}</button>
         ${e.note ? `<div class="muted small">${esc(e.note)}</div>` : ""}
         ${!e.sources.length ? '<div class="muted small">só no roteador</div>' : ""}</td>
       <td class="nowrap">${countryLabel(e.country)}</td>
+      ${showProvider ? `<td class="provider small" title="${esc([e.asn, e.as_name].filter(Boolean).join(" "))}">${e.as_name
+        ? esc(e.as_name) : (e.asn ? esc(e.asn) : '<span class="muted">—</span>')}</td>` : ""}
       <td class="num" title="${e.last_block ? `último bloqueio: ${fmtTs(e.last_block)}` : "sem registro no histórico"}">${e.blocks || '<span class="muted">0</span>'}</td>
       <td>${e.jails.map((j) => `<span class="pill">${esc(j)}</span>`).join(" ")}
         ${e.hold ? `<span class="pill warn" title="o fail2ban já liberou; o MikroTik mantém o bloqueio (reincidência ${e.hold.cycles}, jail ${esc(e.hold.jails)})">retido até ${fmtTs(e.hold.release_at)}</span>` : ""}</td>
@@ -251,7 +259,7 @@ function renderEntries() {
       ${routers.map((r) => `<td class="center">${stateBadge(e.routers[r.id])}</td>`).join("")}
       <td><div class="actions">${rowActions(e)}</div></td>
     </tr>`).join("")
-    : `<tr><td colspan="${routers.length + 6}" class="empty">nada encontrado</td></tr>`;
+    : `<tr><td colspan="${routers.length + 6 + (showProvider ? 1 : 0)}" class="empty">nada encontrado</td></tr>`;
   $("#entries-table").innerHTML = head + `<tbody>${body}</tbody>`;
 }
 
